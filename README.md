@@ -1,6 +1,6 @@
 GitHub:
 
-wget https://raw.githubusercontent.com/asraful-oss/export/main/(file-name)
+wget https://raw.githubusercontent.com/rahul-call/inner/main/(file-name)
 
 Codeberg:
 
