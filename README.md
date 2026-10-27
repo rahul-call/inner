@@ -17,3 +17,6 @@ wget https://raw.githubusercontent.com/asraful-oss/export/main/path/to/file-name
 ## Codeberg:
 
 wget https://codeberg.org/boss-defender/expo/raw/branch/main/path/to/file-name
+
+
+> https://raw.githubusercontent.com/rahul-call/export/main/ror/
