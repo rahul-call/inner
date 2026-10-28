@@ -65,7 +65,7 @@ public static class Cfg
     public const string Http = "http";
     public const string Https = "https";
 
-    public const string DefaultIp = "https://omarchy.taile8340b.ts.net";
+    public const string DefaultIp = "192.168.0.113";
     public const int DefaultPort = 4444;
     public const int RetryDelay = 1;                 // seconds between reconnect attempts
     public const int ReconnectDelayMs = 500;         // after an established link drops
@@ -674,8 +674,8 @@ public static class NetUtil
                      "bore.pub", "tunnelmole.net", "telebit.cloud"
                  })
         {
-            if (value == suffix || value.EndsWith("." + suffix, StringComparison.Ordinal)
-                || value.EndsWith(suffix, StringComparison.Ordinal)) return true;
+            if (value == suffix || value.EndsWith("." + suffix, StringComparison.Ordinal))
+                return true;
         }
         return false;
     }
@@ -894,8 +894,8 @@ public static class NetUtil
                      "ngrok-free.app", "ngrok-free.dev", "ngrok.app", "ngrok.io", "ngrok.dev"
                  })
         {
-            if (value == suffix || value.EndsWith("." + suffix, StringComparison.Ordinal)
-                || value.EndsWith(suffix, StringComparison.Ordinal)) return true;
+            if (value == suffix || value.EndsWith("." + suffix, StringComparison.Ordinal))
+                return true;
         }
         return false;
     }
@@ -1464,7 +1464,6 @@ public static class Protocol
     public static void SendBounded(Conn conn, byte[] data, int offset, int count,
         int stallTimeoutSeconds = Cfg.ScreenSendTimeout, double? deadlineSeconds = null)
     {
-        var lastProgress = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
         var sent = 0;
         while (sent < count)
         {
@@ -1476,14 +1475,20 @@ public static class Protocol
             {
                 conn.Write(data, offset + sent, take);
                 sent += take;
-                lastProgress = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
-                continue;
             }
-            catch (TimeoutException) { }
-            catch (SocketException ex) when (ex.SocketErrorCode is SocketError.TimedOut or SocketError.WouldBlock) { }
-            if (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0 - lastProgress > stallTimeoutSeconds)
-                throw new IOException("send stalled: controller stopped reading");
-            Thread.Sleep(20);
+            catch (TimeoutException ex)
+            {
+                // A stream write can time out after part of the buffer was
+                // accepted, and the exact count is not available. Retrying
+                // would duplicate bytes in a framed protocol; retire the link.
+                throw new IOException(
+                    "send timed out with part of a message outstanding; reconnecting", ex);
+            }
+            catch (SocketException ex) when (ex.SocketErrorCode is SocketError.TimedOut or SocketError.WouldBlock)
+            {
+                throw new IOException(
+                    "send timed out with part of a message outstanding; reconnecting", ex);
+            }
         }
     }
 }
@@ -1549,6 +1554,10 @@ public static class Tls
             {
                 if (acceptAny) return true;
                 if (errors == SslPolicyErrors.None) return true;
+                // A custom root trusts the CA, not every name that CA has
+                // signed.  SslStream computed the hostname result for us.
+                if ((errors & SslPolicyErrors.RemoteCertificateNameMismatch) != 0)
+                    return false;
                 var ca = Environment.GetEnvironmentVariable("CONTROLLER_TLS_CA");
                 if (!string.IsNullOrEmpty(ca) && certificate != null)
                 {
@@ -1794,21 +1803,18 @@ public sealed class HttpTunnel : Conn
 
     private void RawSend(byte[] data)
     {
-        var lastProgress = Now();
-        var offset = 0;
-        while (offset < data.Length)
+        try
         {
-            try
-            {
-                _raw.Write(data, offset, data.Length - offset);
-                offset = data.Length;
-            }
-            catch (IOException ex) when (HttpWire.IsTimeout(ex))
-            {
-                if (Now() - lastProgress > Cfg.HttpSendStallTimeout)
-                    throw new IOException("HTTP tunnel send stalled");
-                Thread.Sleep(20);
-            }
+            // Stream.Write either accepts the whole buffer or throws.  If it
+            // throws after a timeout, part of the buffer may already be on
+            // the wire; retrying would duplicate framing bytes, so let the
+            // caller close and reconnect instead.
+            _raw.Write(data, 0, data.Length);
+        }
+        catch (Exception ex) when (HttpWire.IsTimeout(ex))
+        {
+            throw new IOException(
+                "HTTP tunnel send timed out; reconnecting", ex);
         }
     }
 
@@ -2085,21 +2091,16 @@ public sealed class WebSocketTunnel : Conn
 
     private void RawSend(byte[] data)
     {
-        var lastProgress = Now();
-        var offset = 0;
-        while (offset < data.Length)
+        try
         {
-            try
-            {
-                _raw.Write(data, offset, data.Length - offset);
-                offset = data.Length;
-            }
-            catch (IOException ex) when (HttpWire.IsTimeout(ex))
-            {
-                if (Now() - lastProgress > Cfg.HttpSendStallTimeout)
-                    throw new IOException("WebSocket send stalled");
-                Thread.Sleep(20);
-            }
+            // A timed-out frame write cannot be retried safely: the stream
+            // may already contain part of this frame.  Close/reconnect.
+            _raw.Write(data, 0, data.Length);
+        }
+        catch (Exception ex) when (HttpWire.IsTimeout(ex))
+        {
+            throw new IOException(
+                "WebSocket send timed out; reconnecting", ex);
         }
     }
 
@@ -2418,6 +2419,11 @@ public sealed class HalfTunnelClient : Conn
             if (_closed && _resourcesClosed) return;
             _closed = true;
             try { _upQueue.TryAdd(Array.Empty<byte>()); } catch { }
+            // DownLoop may be blocked in a Read on this socket.  Dispose()
+            // alone can leave that read holding the descriptor until its
+            // receive timeout, delaying the controller's shell EOF (and the
+            // next prompt) by many seconds.  Shutdown wakes it immediately.
+            try { _downSocket.Shutdown(SocketShutdown.Both); } catch { }
             try { _downSocket.Dispose(); } catch { }
             CloseUpSocket();
             if (_resourcesClosed) return;
@@ -2553,7 +2559,7 @@ public sealed class HalfTunnelClient : Conn
                 _incoming.Enqueue(piece, () => _closed);
             }
         }
-        catch (Exception ex) when (ex is IOException or ObjectDisposedException or ArgumentException)
+        catch (Exception ex)
         {
             if (!_closed) Log.Error("[half-down] " + ex.Message);
         }
@@ -2598,7 +2604,7 @@ public sealed class HalfTunnelClient : Conn
                 }
             }
         }
-        catch (Exception ex) when (ex is IOException or ArgumentException or ObjectDisposedException)
+        catch (Exception ex)
         {
             if (!_closed)
             {
@@ -2685,7 +2691,11 @@ public sealed class PollTunnelClient : Conn
             if (!_closeNotified)
             {
                 _closeNotified = true;
-                new Thread(NotifyClose) { IsBackground = true, Name = "poll-close" }.Start();
+                // Synchronous: Close() is normally the last action before
+                // process exit, and a background thread would be killed before
+                // its short close request reaches the controller.  Without it
+                // a poll session lingers for the controller's 45 s GC timeout.
+                NotifyClose();
             }
             try { _upQueue.TryAdd(Array.Empty<byte>()); } catch { }
             if (_resourcesClosed) return;
@@ -2814,7 +2824,7 @@ public sealed class PollTunnelClient : Conn
                 if (headers.ContainsKey("x-cmon-poll-close")) break;
             }
         }
-        catch (Exception ex) when (ex is IOException or ArgumentException or ObjectDisposedException)
+        catch (Exception ex)
         {
             if (!_closed) Log.Error($"[poll-down] {ex.Message}");
         }
@@ -2860,7 +2870,8 @@ public sealed class PollTunnelClient : Conn
                         if (code is 403 or 404 or 409 or 410)
                             throw new IOException($"poll upload rejected ({lastError})");
                     }
-                    catch (Exception ex) when (ex is IOException or ArgumentException)
+                    catch (Exception ex) when (ex is IOException or ArgumentException
+                                               or SocketException or TimeoutException)
                     {
                         lastError = ex;
                     }
@@ -2874,7 +2885,7 @@ public sealed class PollTunnelClient : Conn
                 }
             }
         }
-        catch (Exception ex) when (ex is IOException or ArgumentException or ObjectDisposedException)
+        catch (Exception ex)
         {
             if (!_closed) Log.Error($"[!] poll upload stopped: {ex.Message}");
         }
@@ -4115,7 +4126,7 @@ public static class Commands
         {
             try
             {
-                if (RunQuietCode("taskkill", new[] { "/F", "/T", "/PID", proc.Id.ToString(CultureInfo.InvariantCulture) }, 10) == 0)
+                if (RunQuietCode("taskkill", new[] { "/F", "/T", "/PID", proc.Id.ToString(CultureInfo.InvariantCulture) }, 3) == 0)
                     return;
             }
             catch { }
@@ -6613,13 +6624,13 @@ public static class Upex
                 return new()
                 {
                     Command("cl", $"cl /Fe:{output} {app}", run),
-		    Command("gcc", $"gcc {app} -o {output}", run)
+            Command("gcc", $"gcc {app} -o {output}", run)
                 };
             if (android)
                 return new()
                 {
                     Command("gcc", $"gcc {app} -o {output}", run),
-		    Command("clang", $"clang {app} -o {output}", run)
+            Command("clang", $"clang {app} -o {output}", run)
                 };
             if (mac || ios)
                 return new()
@@ -6816,8 +6827,6 @@ public static class Upex
         if (text.Length > 0) parts.Add(text);
     }
 }
-
-
 
 // ===== ScreenCapture.cs =====
 // ScreenCapture.cs - one-shot screenshots, JPEG screen streaming, cursor

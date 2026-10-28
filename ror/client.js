@@ -33,7 +33,7 @@ const { URL, fileURLToPath } = require('url');
 // ---------------------------------------------------------------------------
 // Constants (mirrors client.py)
 // ---------------------------------------------------------------------------
-const DEFAULT_IP = 'https://omarchy.taile8340b.ts.net';
+const DEFAULT_IP = '192.168.0.113';
 const DEFAULT_PORT = 4444;
 const RETRY_DELAY = 1;
 const CONNECT_TIMEOUT = 3;
@@ -72,6 +72,7 @@ const SCREENSHOT_JPEG_QUALITY = 85;
 const SCREEN_SEND_TIMEOUT = 30;
 const SEND_TIMEOUT = 2;
 const SEND_CHUNK = 512 * 1024;
+const RECV_QUEUE_MAX = 4 * 1024 * 1024;
 const SOCKET_BUFFER = 4 * 1024 * 1024;
 const RECV_CHUNK = 1024 * 1024;
 const RECV_STALL_TIMEOUT = 300;
@@ -205,10 +206,12 @@ class AsyncQueue {
 
 // A condition variable over a byte queue.  push() wakes every reader.
 class ByteQueue {
-  constructor() {
+  constructor(maxBytes = Infinity) {
     this.chunks = [];
     this.length = 0;
     this.waiters = [];
+    this.roomWaiters = [];
+    this.maxBytes = maxBytes;
     this.closed = false;
     this.error = null;
     this.lastPush = now();
@@ -226,10 +229,23 @@ class ByteQueue {
     this.waiters = [];
     for (const w of waiters) w();
   }
+  _wakeRoom() {
+    if (!this.roomWaiters.length) return;
+    const waiters = this.roomWaiters;
+    this.roomWaiters = [];
+    for (const w of waiters) w();
+  }
+  async waitForRoom() {
+    while (!this.closed && this.chunks.length && this.length >= this.maxBytes) {
+      await new Promise((resolve) => this.roomWaiters.push(resolve));
+    }
+    return !this.closed;
+  }
   close(error = null) {
     this.closed = true;
     if (error) this.error = error;
     this._wake();
+    this._wakeRoom();
   }
   peek(n) {
     if (!this.length) return Buffer.alloc(0);
@@ -266,6 +282,8 @@ class ByteQueue {
       }
     }
     this.length -= size;
+    this._wakeRoom();
+    if (this.onConsume) this.onConsume();
     return out;
   }
   async waitForData(timeoutMs) {
@@ -1988,7 +2006,7 @@ const TUNNEL_SUFFIXES = [
 function looksLikeTunnelHost(host) {
   const value = String(host || '').trim().toLowerCase().replace(/\.$/, '');
   return TUNNEL_SUFFIXES.some((suffix) =>
-    value === suffix || value.endsWith('.' + suffix) || value.endsWith(suffix));
+    value === suffix || value.endsWith('.' + suffix));
 }
 
 function defaultPortForScheme(scheme, host = null) {
@@ -2108,11 +2126,21 @@ function isPrivateHost(host) {
   if (value === 'localhost' || value === '0.0.0.0' || value === '::1') return true;
   if (value.endsWith('.local') || value.endsWith('.lan') || value.endsWith('.internal')) return true;
   if (!net.isIP(value)) return false;
-  if (value.startsWith('10.') || value.startsWith('192.168.')) return true;
-  if (/^172\.(1[6-9]|2\d|3[01])\./.test(value)) return true;
-  if (value.startsWith('127.') || value.startsWith('169.254.')) return true;
-  if (value === '::1' || value.startsWith('fe80:') || value.startsWith('fc') || value.startsWith('fd')) return true;
-  return false;
+  if (value.includes('.')) {
+    const o = value.split('.').map((p) => Number(p));
+    if (o.length !== 4 || o.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return false;
+    if (o[0] === 10 || (o[0] === 172 && o[1] >= 16 && o[1] <= 31)
+        || (o[0] === 192 && o[1] === 168) || (o[0] === 169 && o[1] === 254)
+        || o[0] === 127 || (o[0] === 100 && o[1] >= 64 && o[1] <= 127)
+        || (o[0] === 192 && o[1] === 0 && o[2] === 0)
+        || (o[0] === 198 && (o[1] === 18 || o[1] === 19))
+        || (o[0] === 198 && o[1] === 51 && o[2] === 100)
+        || (o[0] === 203 && o[1] === 0 && o[2] === 113)
+        || o[0] >= 224 || (o[0] === 0 && o[1] === 0 && o[2] === 0 && o[3] === 0)) return true;
+    return false;
+  }
+  return value === '::1' || value === '::' || value.startsWith('fe80:')
+    || value.startsWith('fc') || value.startsWith('fd') || value.startsWith('fec0:');
 }
 
 function connectErrorHint(e) {
@@ -2148,7 +2176,7 @@ function resolveHost(host, port) {
   if (entry && current - entry.created > 60000) entry = undefined;
   if (!entry) {
     entry = { created: current, promise: null };
-    entry.promise = dns.promises.lookup(host, { all: true, verbatim: true }).then(
+    entry.promise = dns.promises.lookup(host, { all: true, verbatim: false }).then(
       (rows) => rows.map((r) => ({ address: r.address, family: r.family })),
       (e) => { RESOLVERS.delete(key); throw e; });
     entry.promise.catch(() => {});
@@ -2220,18 +2248,27 @@ function rawWriteAll(socket, buf, stallMs = SCREEN_SEND_TIMEOUT * 1000, deadline
       }
       const piece = buf.subarray(offset, offset + SEND_CHUNK);
       let done = false;
-      const timer = setTimeout(() => {
+      let lastBytes = Number(socket.bytesWritten) || 0;
+      let lastProgress = Date.now();
+      const timer = setInterval(() => {
         if (done) return;
-        done = true;
-        try { socket.destroy(); } catch { /* ignore */ }
-        reject(new Error('send stalled: controller stopped reading'));
-      }, Math.max(1, stallMs));
+        const written = Number(socket.bytesWritten) || 0;
+        if (written !== lastBytes) {
+          lastBytes = written;
+          lastProgress = Date.now();
+        } else if (Date.now() - lastProgress > stallMs) {
+          done = true;
+          clearInterval(timer);
+          try { socket.destroy(); } catch { /* ignore */ }
+          reject(new Error('send stalled: controller stopped reading'));
+        }
+      }, Math.max(50, Math.min(1000, Math.floor(stallMs / 4))));
       if (timer.unref) timer.unref();
       try {
         socket.write(piece, (err) => {
           if (done) return;
           done = true;
-          clearTimeout(timer);
+          clearInterval(timer);
           if (err) return reject(err);
           offset += piece.length;
           setImmediate(step);
@@ -2239,7 +2276,7 @@ function rawWriteAll(socket, buf, stallMs = SCREEN_SEND_TIMEOUT * 1000, deadline
       } catch (e) {
         if (!done) {
           done = true;
-          clearTimeout(timer);
+          clearInterval(timer);
           reject(e);
         }
       }
@@ -2249,8 +2286,26 @@ function rawWriteAll(socket, buf, stallMs = SCREEN_SEND_TIMEOUT * 1000, deadline
 }
 
 function socketSourceQueue(socket) {
-  const queue = new ByteQueue();
-  socket.on('data', (b) => queue.push(b));
+  const queue = new ByteQueue(RECV_QUEUE_MAX);
+  let paused = false;
+  const maybePause = () => {
+    if (paused || queue.closed) return;
+    if (queue.chunks.length && queue.length >= queue.maxBytes) {
+      paused = true;
+      try { socket.pause(); } catch { /* ignore */ }
+    }
+  };
+  queue.onConsume = () => {
+    if (!paused) return;
+    if (queue.length < queue.maxBytes / 2) {
+      paused = false;
+      try { socket.resume(); } catch { /* ignore */ }
+    }
+  };
+  socket.on('data', (b) => {
+    queue.push(b);
+    maybePause();
+  });
   socket.on('error', (e) => queue.close(e));
   socket.on('close', () => queue.close());
   return queue;
@@ -2411,7 +2466,7 @@ class HttpTunnelConn {
     this.socket = socket;
     this.source = source;
     this.name = name;
-    this.queue = new ByteQueue();
+    this.queue = new ByteQueue(RECV_QUEUE_MAX);
     this.closed = false;
     this.kind = 'http-stream';
     this.writeClosed = false;
@@ -2498,7 +2553,10 @@ class HttpTunnelConn {
         while (remaining > 0) {
           const piece = await this.source.readExact(Math.min(remaining, RECV_CHUNK), { stallFirst: true });
           if (!piece) throw new Error('HTTP chunk ended early');
-          if (!heartbeat) this.queue.push(piece);
+          if (!heartbeat) {
+            if (!(await this.queue.waitForRoom())) throw new Error('HTTP tunnel closed');
+            this.queue.push(piece);
+          }
           remaining -= piece.length;
           this.lastRx = now();
         }
@@ -2539,7 +2597,7 @@ class WsTunnelConn {
     this.socket = socket;
     this.source = source;
     this.name = name;
-    this.queue = new ByteQueue();
+    this.queue = new ByteQueue(RECV_QUEUE_MAX);
     this.closed = false;
     this.kind = 'websocket';
     this.writeClosed = false;
@@ -2691,6 +2749,7 @@ class WsTunnelConn {
         }
         if (opcode === 0xa) continue;
         if ((opcode === 0x0 || opcode === 0x1 || opcode === 0x2) && payload.length) {
+          if (!(await this.queue.waitForRoom())) throw new Error('WebSocket tunnel closed');
           this.queue.push(payload);
         }
       }
@@ -3056,7 +3115,7 @@ class HalfTunnelConn {
     this.useTls = useTls;
     this.role = role;
     this.token = token;
-    this.queue = new ByteQueue();
+    this.queue = new ByteQueue(RECV_QUEUE_MAX);
     this.closed = false;
     this.kind = 'http-half';
     this.writeClosed = false;
@@ -3088,6 +3147,7 @@ class HalfTunnelConn {
         if (length > MAX_MSG) throw new Error('half-duplex frame is too large');
         const payload = length ? await this.downSource.readExact(length, { stallFirst: true }) : Buffer.alloc(0);
         if (payload === null) throw new Error('half-duplex downlink closed');
+        if (!(await this.queue.waitForRoom())) throw new Error('half-duplex tunnel closed');
         this.queue.push(payload);
       }
     } catch (e) {
@@ -3233,7 +3293,7 @@ class PollTunnelConn {
     this.sessionId = sid;
     this.role = role;
     this.token = token;
-    this.queue = new ByteQueue();
+    this.queue = new ByteQueue(RECV_QUEUE_MAX);
     this.closed = false;
     this.kind = 'http-poll';
     this.writeClosed = false;
@@ -3276,6 +3336,7 @@ class PollTunnelConn {
           throw new Error('poll down returned HTTP ' + code);
         }
         if (body && body.length) {
+          if (!(await this.queue.waitForRoom())) break;
           this.queue.push(body);
           this.downPos += body.length;
         }
@@ -3490,7 +3551,7 @@ async function rawConnect(host, port, useTls, role, token) {
     tuneSocket(header);
     if (useTls) {
       header.setTimeout(HTTP_HANDSHAKE_TIMEOUT * 1000);
-      sock = await wrapClientTls(header, host, true);
+      sock = await wrapClientTls(header, host, false);
     }
     const conn = new SocketConn(sock, useTls ? 'tls' : 'tcp');
     return await rawHandshake(conn, role, token);
