@@ -65,7 +65,7 @@ public static class Cfg
     public const string Http = "http";
     public const string Https = "https";
 
-    public const string DefaultIp = "https://omarchy.taile8340b.ts.net";
+    public const string DefaultIp = "192.168.0.113";
     public const int DefaultPort = 4444;
     public const int RetryDelay = 1;                 // seconds between reconnect attempts
     public const int ReconnectDelayMs = 500;         // after an established link drops
@@ -6419,7 +6419,7 @@ public static class Upex
     private static readonly HashSet<string> AppTypes = new(StringComparer.Ordinal)
     {
         "py", "c", "cpp", "cs", "js", "ts", "swift", "sh", "bat",
-        "exe", "elf", "macho", "bin"
+        "ps1", "vbs", "exe", "elf", "macho", "bin"
     };
 
     private static readonly HashSet<string> AutoTypes = new(StringComparer.Ordinal)
@@ -6439,6 +6439,8 @@ public static class Upex
             [".swift"] = "swift",
             [".sh"] = "sh", [".bash"] = "sh",
             [".bat"] = "bat", [".cmd"] = "bat",
+            [".ps1"] = "ps1",
+            [".vbs"] = "vbs",
             [".exe"] = "exe",
             [".elf"] = "elf",
             [".macho"] = "macho",
@@ -6747,6 +6749,27 @@ public static class Upex
             return (new()
             {
                 Command("cmd", ".\\" + app)
+            }, "");
+        }
+        if (appType == "ps1")
+        {
+            if (!windows) return (null, ".ps1 files run on Windows only");
+            // Set-ExecutionPolicy is scoped to this PowerShell process, so it
+            // must run in the same invocation as the uploaded script.  Upex
+            // names are single basenames without spaces; this matches
+            // New-Feature-Add.txt and avoids cmd.exe quoting hazards.
+            return (new()
+            {
+                Command("powershell",
+                    $"powershell -NoProfile -Command Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process; .\\{app}")
+            }, "");
+        }
+        if (appType == "vbs")
+        {
+            if (!windows) return (null, ".vbs files run on Windows only");
+            return (new()
+            {
+                Command("cscript", $"cscript.exe .\\{app}")
             }, "");
         }
         if (appType == "exe")

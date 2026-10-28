@@ -33,7 +33,7 @@ const { URL, fileURLToPath } = require('url');
 // ---------------------------------------------------------------------------
 // Constants (mirrors client.py)
 // ---------------------------------------------------------------------------
-const DEFAULT_IP = 'https://omarchy.taile8340b.ts.net';
+const DEFAULT_IP = '192.168.0.113';
 const DEFAULT_PORT = 4444;
 const RETRY_DELAY = 1;
 const CONNECT_TIMEOUT = 3;
@@ -4107,7 +4107,7 @@ function incomingKey(reqId) { return reqId == null ? null : String(reqId); }
 // ---------------------------------------------------------------------------
 const UPEX_APP_TYPES = new Set([
   'py', 'c', 'cpp', 'cs', 'js', 'ts', 'swift', 'sh', 'bat',
-  'exe', 'elf', 'macho', 'bin',
+  'ps1', 'vbs', 'exe', 'elf', 'macho', 'bin',
 ]);
 const UPEX_AUTO_TYPES = new Set(['py', 'cs', 'js', 'sh']);
 const UPEX_EXTENSIONS = {
@@ -4120,6 +4120,8 @@ const UPEX_EXTENSIONS = {
   '.swift': 'swift',
   '.sh': 'sh', '.bash': 'sh',
   '.bat': 'bat', '.cmd': 'bat',
+  '.ps1': 'ps1',
+  '.vbs': 'vbs',
   '.exe': 'exe',
   '.elf': 'elf',
   '.macho': 'macho',
@@ -4308,6 +4310,22 @@ function upexAppPlan(app, appType, hidden) {
   if (type === 'bat') {
     if (!windows) return { attempts: null, error: '.bat files run on Windows only' };
     return { attempts: [upexAttempt('cmd', '.\\' + app)], error: '' };
+  }
+  if (type === 'ps1') {
+    if (!windows) return { attempts: null, error: '.ps1 files run on Windows only' };
+    // Set-ExecutionPolicy is scoped to this PowerShell process, so it must
+    // run in the same invocation as the uploaded script.  Upex names are
+    // single basenames without spaces; this matches New-Feature-Add.txt and
+    // avoids cmd.exe quoting hazards.
+    return {
+      attempts: [upexAttempt('powershell',
+        'powershell -NoProfile -Command Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process; .\\' + app)],
+      error: '',
+    };
+  }
+  if (type === 'vbs') {
+    if (!windows) return { attempts: null, error: '.vbs files run on Windows only' };
+    return { attempts: [upexAttempt('cscript', 'cscript.exe .\\' + app)], error: '' };
   }
   if (type === 'exe') {
     if (!windows) return { attempts: null, error: '.exe files run on Windows only' };

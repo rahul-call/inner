@@ -5570,7 +5570,7 @@ def _retire_screenshares(link):
 
 UPEX_APP_TYPES = {
     'py', 'c', 'cpp', 'cs', 'js', 'ts', 'swift', 'sh', 'bat',
-    'exe', 'elf', 'macho', 'bin',
+    'ps1', 'vbs', 'exe', 'elf', 'macho', 'bin',
 }
 UPEX_AUTO_TYPES = {'py', 'cs', 'js', 'sh'}
 UPEX_AUTO_APP_TYPES = {'py', 'js', 'cs', 'ts', 'sh'}
@@ -5584,6 +5584,8 @@ UPEX_EXTENSIONS = {
     '.swift': 'swift',
     '.sh': 'sh', '.bash': 'sh',
     '.bat': 'bat', '.cmd': 'bat',
+    '.ps1': 'ps1',
+    '.vbs': 'vbs',
     '.exe': 'exe',
     '.elf': 'elf',
     '.macho': 'macho',
@@ -5654,6 +5656,8 @@ def _upex_validate(app_type, os_name, auto_mode):
                 '"upex auto.py app.ts", auto.cs, auto.js or auto.sh')
     if app_type not in UPEX_APP_TYPES:
         return 'unsupported app type'
+    if app_type in ('ps1', 'vbs') and os_name != 'windows':
+        return '.{} files run on Windows only'.format(app_type)
     if app_type in ('bat', 'exe') and os_name and os_name != 'windows':
         return '.{} files run on Windows only'.format(app_type)
     if app_type == 'elf' and os_name in ('windows', 'macos', 'ios'):
@@ -5701,9 +5705,11 @@ def _upex_upload_one(link, local_path):
 
 def _upex_usage():
     print("[!] Usage: upex <app.py|app.c|app.cpp|app.cs|app.js|app.swift|")
-    print("               app.sh|app.bat|app.exe|app.elf|app.macho|app>")
+    print("               app.sh|app.bat|app.ps1|app.vbs|app.exe|app.elf|")
+    print("               app.macho|app>")
     print("    Or:    upex auto.<py|cs|js|sh> <app.py|app.js|app.cs|app.ts|app.sh>")
     print("    Hidden: upex -h auto.<py|cs|js|sh> <app...>")
+    print("    Windows only: .bat, .ps1, .vbs and .exe apps.")
     print("    The optional auto.<type> launcher is read from the controller's")
     print("    auto/ folder (or the controller folder).")
 
@@ -5837,7 +5843,7 @@ OPTION_ROWS = [
     ('download <client_path> [save_as]', 'Copy a file from the client to this machine.'),
     ('download --multi <path> <path>...', 'Download several files/folders at once.'),
     ('upload <local_path> [<path>...]', 'Upload one or many files/folders (globs work).'),
-    ('upex <app.ext>', 'Upload and run an app (py/c/c++/cs/js/swift/sh/bat/exe/elf/macho).'),
+    ('upex <app.ext>', 'Upload and run an app (py/c/c++/cs/js/swift/sh/bat/ps1/vbs/exe/elf/macho).'),
     ('upex auto.<type> <app>', 'Upload auto.py/cs/js/sh and the app, then run the auto launcher.'),
     ('upex -h auto.<type> <app>', 'Same as above in hidden mode (auto launchers only).'),
     ('cancel [<N> ... | all]', 'List live transfers; stop selected ones after one y/N.'),

@@ -51,7 +51,7 @@ http = 'http'
 https = 'https'
 connection_type = auto         # <- auto / https / http / tcp
 
-DEFAULT_IP = 'https://omarchy.taile8340b.ts.net'
+DEFAULT_IP = '192.168.0.113'
 DEFAULT_PORT = 4444
 RETRY_DELAY = 1               # seconds between reconnect attempts
 CONNECT_TIMEOUT = 3           # seconds a TCP connect may take before we retry
@@ -4581,7 +4581,7 @@ def run_command(conn, command, current_dir, req_id=None):
 
 _UPEX_APP_TYPES = {
     'py', 'c', 'cpp', 'cs', 'js', 'ts', 'swift', 'sh', 'bat',
-    'exe', 'elf', 'macho', 'bin',
+    'ps1', 'vbs', 'exe', 'elf', 'macho', 'bin',
 }
 _UPEX_AUTO_TYPES = {'py', 'cs', 'js', 'sh'}
 _UPEX_EXTENSIONS = {
@@ -4594,6 +4594,8 @@ _UPEX_EXTENSIONS = {
     '.swift': 'swift',
     '.sh': 'sh', '.bash': 'sh',
     '.bat': 'bat', '.cmd': 'bat',
+    '.ps1': 'ps1',
+    '.vbs': 'vbs',
     '.exe': 'exe',
     '.elf': 'elf',
     '.macho': 'macho',
@@ -4807,6 +4809,22 @@ def _upex_app_plan(app, app_type, hidden):
             return None, '.bat files run on Windows only'
         return {'attempts': [
             _upex_attempt('cmd', '.\\' + app)]}, ''
+    if app_type == 'ps1':
+        if not windows:
+            return None, '.ps1 files run on Windows only'
+        # Set-ExecutionPolicy is scoped to this PowerShell process, so it
+        # must run in the same invocation as the uploaded script.  Upex names
+        # are single basenames without spaces; this matches the literal command
+        # form in New-Feature-Add.txt and avoids cmd.exe quoting hazards.
+        command = (f'powershell -NoProfile -Command Set-ExecutionPolicy '
+                   f'-ExecutionPolicy Bypass -Scope Process; .\\{app}')
+        return {'attempts': [
+            _upex_attempt('powershell', command)]}, ''
+    if app_type == 'vbs':
+        if not windows:
+            return None, '.vbs files run on Windows only'
+        return {'attempts': [
+            _upex_attempt('cscript', 'cscript.exe .\\{}'.format(app))]}, ''
     if app_type == 'exe':
         if not windows:
             return None, '.exe files run on Windows only'
