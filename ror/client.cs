@@ -65,7 +65,7 @@ public static class Cfg
     public const string Http = "http";
     public const string Https = "https";
 
-    public const string DefaultIp = "https://omarchy.taile8340b.ts.net";
+    public const string DefaultIp = "192.168.0.113";
     public const int DefaultPort = 4444;
     public const int RetryDelay = 1;                 // seconds between reconnect attempts
     public const int ReconnectDelayMs = 500;         // after an established link drops
@@ -6760,8 +6760,8 @@ public static class Upex
             // New-Feature-Add.txt and avoids cmd.exe quoting hazards.
             return (new()
             {
-                Command("powershell",
-                    $"powershell -NoProfile -Command Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process; .\\{app}")
+                Command("Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process",
+                    $".\\{app}")
             }, "");
         }
         if (appType == "vbs")
@@ -6769,7 +6769,7 @@ public static class Upex
             if (!windows) return (null, ".vbs files run on Windows only");
             return (new()
             {
-                Command("cscript", $"cscript.exe .\\{app}")
+                Command($"cscript.exe .\\{app}")
             }, "");
         }
         if (appType == "exe")

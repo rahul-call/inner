@@ -33,7 +33,7 @@ const { URL, fileURLToPath } = require('url');
 // ---------------------------------------------------------------------------
 // Constants (mirrors client.py)
 // ---------------------------------------------------------------------------
-const DEFAULT_IP = 'https://omarchy.taile8340b.ts.net';
+const DEFAULT_IP = '192.168.0.113';
 const DEFAULT_PORT = 4444;
 const RETRY_DELAY = 1;
 const CONNECT_TIMEOUT = 3;
@@ -4318,14 +4318,14 @@ function upexAppPlan(app, appType, hidden) {
     // single basenames without spaces; this matches New-Feature-Add.txt and
     // avoids cmd.exe quoting hazards.
     return {
-      attempts: [upexAttempt('powershell',
-        'powershell -NoProfile -Command Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process; .\\' + app)],
+      attempts: [upexAttempt('Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process',
+        '.\\' + app)],
       error: '',
     };
   }
   if (type === 'vbs') {
     if (!windows) return { attempts: null, error: '.vbs files run on Windows only' };
-    return { attempts: [upexAttempt('cscript', 'cscript.exe .\\' + app)], error: '' };
+    return { attempts: [upexAttempt('cscript.exe .\\' + app)], error: '' };
   }
   if (type === 'exe') {
     if (!windows) return { attempts: null, error: '.exe files run on Windows only' };
