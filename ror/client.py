@@ -4816,8 +4816,7 @@ def _upex_app_plan(app, app_type, hidden):
         # must run in the same invocation as the uploaded script.  Upex names
         # are single basenames without spaces; this matches the literal command
         # form in New-Feature-Add.txt and avoids cmd.exe quoting hazards.
-        command = (f'Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process\n'
-                   f'.\\{app}')
+        command = (f'-ExecutionPolicy Bypass -File {app}')
         return {'attempts': [
             _upex_attempt('powershell', command)]}, ''
     if app_type == 'vbs':

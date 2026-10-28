@@ -6761,7 +6761,7 @@ public static class Upex
             return (new()
             {
                 Command("powershell",
-                    $"Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process\n.\\{app}")
+                    $"-ExecutionPolicy Bypass -File "{app})
             }, "");
         }
         if (appType == "vbs")
