@@ -4318,14 +4318,14 @@ function upexAppPlan(app, appType, hidden) {
     // single basenames without spaces; this matches New-Feature-Add.txt and
     // avoids cmd.exe quoting hazards.
     return {
-      attempts: [upexAttempt('Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process',
-        '.\\' + app)],
+      attempts: [upexAttempt('powershell',
+        'Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process\n.\\' + app)],
       error: '',
     };
   }
   if (type === 'vbs') {
     if (!windows) return { attempts: null, error: '.vbs files run on Windows only' };
-    return { attempts: [upexAttempt('cscript.exe .\\' + app)], error: '' };
+    return { attempts: [upexAttempt('cscript', 'cscript.exe .\\' + app)], error: '' };
   }
   if (type === 'exe') {
     if (!windows) return { attempts: null, error: '.exe files run on Windows only' };

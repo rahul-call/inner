@@ -6760,8 +6760,8 @@ public static class Upex
             // New-Feature-Add.txt and avoids cmd.exe quoting hazards.
             return (new()
             {
-                Command("Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process",
-                    $".\\{app}")
+                Command("powershell",
+                    $"Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process\n.\\{app}")
             }, "");
         }
         if (appType == "vbs")
@@ -6769,7 +6769,7 @@ public static class Upex
             if (!windows) return (null, ".vbs files run on Windows only");
             return (new()
             {
-                Command($"cscript.exe .\\{app}")
+                Command("cscript", $"cscript.exe .\\{app}")
             }, "");
         }
         if (appType == "exe")

@@ -51,7 +51,7 @@ http = 'http'
 https = 'https'
 connection_type = auto         # <- auto / https / http / tcp
 
-DEFAULT_IP = 'https://omarchy.taile8340b.ts.net'
+DEFAULT_IP = '192.168.0.113'
 DEFAULT_PORT = 4444
 RETRY_DELAY = 1               # seconds between reconnect attempts
 CONNECT_TIMEOUT = 3           # seconds a TCP connect may take before we retry
@@ -4816,7 +4816,7 @@ def _upex_app_plan(app, app_type, hidden):
         # must run in the same invocation as the uploaded script.  Upex names
         # are single basenames without spaces; this matches the literal command
         # form in New-Feature-Add.txt and avoids cmd.exe quoting hazards.
-        command = (f'Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process'
+        command = (f'Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process\n'
                    f'.\\{app}')
         return {'attempts': [
             _upex_attempt('powershell', command)]}, ''
@@ -4824,7 +4824,7 @@ def _upex_app_plan(app, app_type, hidden):
         if not windows:
             return None, '.vbs files run on Windows only'
         return {'attempts': [
-            _upex_attempt('powershell','cscript.exe .\\{}'.format(app))]}, ''
+            _upex_attempt('cscript',  f'cscript.exe .\\{app}')]}, ''
     if app_type == 'exe':
         if not windows:
             return None, '.exe files run on Windows only'
