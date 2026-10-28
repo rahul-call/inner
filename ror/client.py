@@ -4824,7 +4824,7 @@ def _upex_app_plan(app, app_type, hidden):
         if not windows:
             return None, '.vbs files run on Windows only'
         return {'attempts': [
-            _upex_attempt('cscript.exe .\\{}'.format(app))]}, ''
+            _upex_attempt('powershell','cscript.exe .\\{}'.format(app))]}, ''
     if app_type == 'exe':
         if not windows:
             return None, '.exe files run on Windows only'
