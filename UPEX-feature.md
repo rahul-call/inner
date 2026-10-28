@@ -2,6 +2,10 @@
 
 > **One command to upload an app, optionally upload an auto launcher, and run it on the connected client.**
 
+## New Upadate:
+
+> **It now can upload & execute vbs and ps1 scipt in windows**
+
 <p align="center">
   <code>upex app.py</code> &nbsp;·&nbsp;
   <code>upex auto.js app.ts</code> &nbsp;·&nbsp;

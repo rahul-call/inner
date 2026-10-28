@@ -71,7 +71,6 @@ TRANSFER_ENTRY_BYTES = 4 * 1024 * 1024   # ... and by encoded size, not only cou
 CONNECTION_TYPE = str(os.environ.get('TUNNEL_TYPE') or connection_type).strip().lower()
 VALID_CONNECTION_TYPES = ('auto', 'tcp', 'http', 'https')
 HTTP_HANDSHAKE_TIMEOUT = 10    # seconds for HTTP headers / TLS handshake
-HTTP_SEND_STALL_TIMEOUT = 30   # tolerate a slow-but-moving mobile link
 HTTP_MAX_HEADER = 32 * 1024    # reject a peer that sends an endless header
 HTTP_MAX_LINE = 4096           # one chunk-size/trailer line
 HTTP_MAX_CHUNK = MAX_MSG       # one HTTP chunk cannot claim unlimited memory
@@ -186,16 +185,19 @@ def send_msg(conn, obj):
 
 A 50 MB upload sent as one sendall() could freeze the whole controller on
 a client that stopped reading (the OS retransmits for ~15 minutes). Now
-every chunk re-checks the socket: no progress within SEND_STALL_TIMEOUT
-raises OSError and the caller treats the link as dead."""
+every chunk is bounded.  A send timeout is fatal: the kernel may have
+accepted part of the chunk before timing out, and neither sockets nor TLS
+report that count, so retrying would corrupt the next framed message."""
     payload = json.dumps(obj, separators=(',', ':')).encode('utf-8')
     view = memoryview(len(payload).to_bytes(4, 'big') + payload)
     last_progress = time.time()
     while view:
         try:
             sent = conn.send(view[:SEND_CHUNK])
-        except (socket.timeout, TimeoutError, BlockingIOError):
-            sent = 0
+        except (socket.timeout, TimeoutError, BlockingIOError) as exc:
+            raise OSError(
+                'send timed out with part of a message outstanding; '
+                'closing the link') from exc
         if sent:
             view = view[sent:]
             last_progress = time.time()
@@ -1326,22 +1328,17 @@ framing.
     # -- raw HTTP body writer ---------------------------------------------
     def _raw_send(self, data):
         view = memoryview(data)
-        last_progress = time.time()
         while view:
             try:
                 sent = self.raw.send(view)
-            except (socket.timeout, TimeoutError):
-                # SO_SNDTIMEO bounds one kernel wait.  Treat several waits as
-                # one slow transfer instead of dropping a mobile link that is
-                # still draining, but still fail when there is no progress.
-                if time.time() - last_progress > HTTP_SEND_STALL_TIMEOUT:
-                    raise OSError('HTTP tunnel send stalled')
-                time.sleep(0.02)
-                continue
+            except (socket.timeout, TimeoutError) as exc:
+                # A timed-out frame may already contain part of this data;
+                # retrying from the start would duplicate it.  Close instead.
+                raise OSError(
+                    'HTTP tunnel send timed out; closing the link') from exc
             if sent <= 0:
                 raise OSError('HTTP tunnel closed while sending')
             view = view[sent:]
-            last_progress = time.time()
 
     def _send_heartbeat(self):
         """Send a no-op chunk with a marker extension (see CMON_HTTP_PING)."""
@@ -1657,19 +1654,15 @@ shutdown() and socket options without knowing about WebSockets.
     # -- raw socket writer / reader ---------------------------------------
     def _raw_send(self, data):
         view = memoryview(data)
-        last_progress = time.time()
         while view:
             try:
                 sent = self.raw.send(view)
-            except (socket.timeout, TimeoutError):
-                if time.time() - last_progress > HTTP_SEND_STALL_TIMEOUT:
-                    raise OSError('WebSocket send stalled')
-                time.sleep(0.02)
-                continue
+            except (socket.timeout, TimeoutError) as exc:
+                raise OSError(
+                    'WebSocket send timed out; closing the link') from exc
             if sent <= 0:
                 raise OSError('WebSocket closed while sending')
             view = view[sent:]
-            last_progress = time.time()
 
     def _send_control(self, opcode, payload=b''):
         with self._send_lock:
@@ -4527,7 +4520,9 @@ class _ShellInputWriter(object):
             try:
                 sent = self.conn.send(view[:65536])
             except (socket.timeout, TimeoutError, BlockingIOError):
-                sent = 0
+                # The write may have partially succeeded; stop the writer
+                # rather than retrying and duplicating keystrokes.
+                return False
             except (OSError, ValueError):
                 return False
             if sent:
@@ -5575,7 +5570,7 @@ def _retire_screenshares(link):
 
 UPEX_APP_TYPES = {
     'py', 'c', 'cpp', 'cs', 'js', 'ts', 'swift', 'sh', 'bat',
-    'exe', 'elf', 'macho', 'bin',
+    'ps1', 'vbs', 'exe', 'elf', 'macho', 'bin',
 }
 UPEX_AUTO_TYPES = {'py', 'cs', 'js', 'sh'}
 UPEX_AUTO_APP_TYPES = {'py', 'js', 'cs', 'ts', 'sh'}
@@ -5589,6 +5584,8 @@ UPEX_EXTENSIONS = {
     '.swift': 'swift',
     '.sh': 'sh', '.bash': 'sh',
     '.bat': 'bat', '.cmd': 'bat',
+    '.ps1': 'ps1',
+    '.vbs': 'vbs',
     '.exe': 'exe',
     '.elf': 'elf',
     '.macho': 'macho',
@@ -5659,6 +5656,8 @@ def _upex_validate(app_type, os_name, auto_mode):
                 '"upex auto.py app.ts", auto.cs, auto.js or auto.sh')
     if app_type not in UPEX_APP_TYPES:
         return 'unsupported app type'
+    if app_type in ('ps1', 'vbs') and os_name != 'windows':
+        return '.{} files run on Windows only'.format(app_type)
     if app_type in ('bat', 'exe') and os_name and os_name != 'windows':
         return '.{} files run on Windows only'.format(app_type)
     if app_type == 'elf' and os_name in ('windows', 'macos', 'ios'):
@@ -5706,9 +5705,11 @@ def _upex_upload_one(link, local_path):
 
 def _upex_usage():
     print("[!] Usage: upex <app.py|app.c|app.cpp|app.cs|app.js|app.swift|")
-    print("               app.sh|app.bat|app.exe|app.elf|app.macho|app>")
+    print("               app.sh|app.bat|app.ps1|app.vbs|app.exe|app.elf|")
+    print("               app.macho|app>")
     print("    Or:    upex auto.<py|cs|js|sh> <app.py|app.js|app.cs|app.ts|app.sh>")
     print("    Hidden: upex -h auto.<py|cs|js|sh> <app...>")
+    print("    Windows only: .bat, .ps1, .vbs and .exe apps.")
     print("    The optional auto.<type> launcher is read from the controller's")
     print("    auto/ folder (or the controller folder).")
 
@@ -5842,7 +5843,7 @@ OPTION_ROWS = [
     ('download <client_path> [save_as]', 'Copy a file from the client to this machine.'),
     ('download --multi <path> <path>...', 'Download several files/folders at once.'),
     ('upload <local_path> [<path>...]', 'Upload one or many files/folders (globs work).'),
-    ('upex <app.ext>', 'Upload and run an app (py/c/c++/cs/js/swift/sh/bat/exe/elf/macho).'),
+    ('upex <app.ext>', 'Upload and run an app (py/c/c++/cs/js/swift/sh/bat/ps1/vbs/exe/elf/macho).'),
     ('upex auto.<type> <app>', 'Upload auto.py/cs/js/sh and the app, then run the auto launcher.'),
     ('upex -h auto.<type> <app>', 'Same as above in hidden mode (auto launchers only).'),
     ('cancel [<N> ... | all]', 'List live transfers; stop selected ones after one y/N.'),
