@@ -1544,6 +1544,10 @@ function decodeJpegScan(buffer, scanStart, ctx) {
     c.pw = mcuCols * 8 * c.h;
     c.ph = mcuRows * 8 * c.v;
     c.plane = new Uint8Array(c.pw * c.ph);
+    // A scan that stops early (damaged file, truncated transfer) must
+    // degrade to neutral grey.  All-zero YCbCr planes would decode to a
+    // solid green frame - the exact macOS green-screen bug.
+    c.plane.fill(128);
   }
 
   // Entropy-coded bit reader with 0xFF00 stuffing and restart markers.  The
@@ -1561,8 +1565,11 @@ function decodeJpegScan(buffer, scanStart, ctx) {
         const m = bp < buffer.length ? buffer[bp] : 0;
         if (m === 0x00) {
           bp += 1;                            // stuffed byte
+        } else if (m >= 0xd0 && m <= 0xd7) {
+          bp -= 1;                            // restart marker: the MCU loop
+          break;                              // consumes it; never ends the scan
         } else {
-          bp -= 1;                            // restart/EOI: leave it in place
+          bp -= 1;                            // EOI/another marker: leave it
           ended = true;
           break;
         }
@@ -1607,6 +1614,7 @@ function decodeJpegScan(buffer, scanStart, ctx) {
         if (bp + 1 < buffer.length && buffer[bp] === 0xff
           && buffer[bp + 1] >= 0xd0 && buffer[bp + 1] <= 0xd7) {
           bp += 2;
+          ended = false;          // a live restart marker revives the scan
         }
         for (const c of comps) c.pred = 0;
       }
@@ -1763,8 +1771,33 @@ function decodeBmp(data) {
   const bits = data.readUInt16LE(28);
   const compression = data.readUInt32LE(30);
   if (width <= 0 || rawHeight === 0) throw new Error('invalid BMP dimensions');
-  if (compression !== 0) throw new Error('compressed BMP is not supported');
+  if (compression !== 0 && compression !== 3) {
+    throw new Error('compressed BMP is not supported');
+  }
   if (bits !== 24 && bits !== 32) throw new Error('unsupported BMP bit depth: ' + bits);
+  if (compression === 3 && bits !== 32) {
+    throw new Error('BI_BITFIELDS needs a 32-bit BMP');
+  }
+  // BI_BITFIELDS: the R/G/B masks live at file offset 54 - inside the header
+  // for the V4/V5 forms, right after the 40-byte core header for the classic
+  // masked form.  Missing or zero masks fall back to the default BGRX layout.
+  let rMask = 0, gMask = 0, bMask = 0;
+  if (compression === 3) {
+    if (54 + 12 <= data.length && (headerSize >= 52 || pixelOffset >= 54 + 12)) {
+      rMask = data.readUInt32LE(54);
+      gMask = data.readUInt32LE(58);
+      bMask = data.readUInt32LE(62);
+    }
+    if (!rMask && !gMask && !bMask) {
+      rMask = 0x00ff0000; gMask = 0x0000ff00; bMask = 0x000000ff;
+    }
+  }
+  const maskInfo = (mask) => {
+    let shift = 0;
+    while (mask && (mask & 1) === 0) { mask >>>= 1; shift += 1; }
+    return { shift, scale: mask ? 255 / mask : 0 };
+  };
+  const ri = maskInfo(rMask), gi = maskInfo(gMask), bi = maskInfo(bMask);
   const height = Math.abs(rawHeight);
   const topDown = rawHeight < 0;
   const stride = Math.floor((width * bits + 31) / 32) * 4;
@@ -1777,9 +1810,16 @@ function decodeBmp(data) {
     let dst = y * width * 3;
     for (let x = 0; x < width; x++) {
       const src = srcRow + x * bytes;
-      out[dst++] = data[src + 2];             // BGR(A) -> RGB
-      out[dst++] = data[src + 1];
-      out[dst++] = data[src];
+      if (compression === 3) {
+        const px = data.readUInt32LE(src);
+        out[dst++] = Math.round(((px & rMask) >>> ri.shift) * ri.scale);
+        out[dst++] = Math.round(((px & gMask) >>> gi.shift) * gi.scale);
+        out[dst++] = Math.round(((px & bMask) >>> bi.shift) * bi.scale);
+      } else {
+        out[dst++] = data[src + 2];           // BGR(A) -> RGB
+        out[dst++] = data[src + 1];
+        out[dst++] = data[src];
+      }
     }
   }
   return { width, height, data: out };
@@ -4665,7 +4705,14 @@ async function bridgeShell(conn, child, mode, rows, cols) {
             line = [];
             enqueueOutput(Buffer.from('\r\n', 'utf8'));
             if (!child.stdin.destroyed) {
-              try { child.stdin.write(command + '\r\n'); } catch { /* ignore */ }
+              // A pipe-fed shell needs a bare '\n': a trailing '\r' becomes
+              // part of the command and the shell answers
+              // "command not found: ^M" (the macOS bug).  Through script(1)
+              // the PTY's ICRNL expects exactly one '\r' instead.
+              const payload = mode === 'pty'
+                ? command + '\r'
+                : command.replace(/\r+$/, '') + '\n';
+              try { child.stdin.write(payload); } catch { /* ignore */ }
             }
             continue;
           }
@@ -4679,9 +4726,16 @@ async function bridgeShell(conn, child, mode, rows, cols) {
           if (char === '\x03') {
             line = [];
             enqueueOutput(Buffer.from('^C\r\n', 'utf8'));
-            // 0x03 written to a pipe is not an interrupt, but some hosts
-            // still honour it; there is no portable console-event path here.
-            if (!child.stdin.destroyed) {
+            // 0x03 written to a pipe is just a byte, not an interrupt.  The
+            // detached spawn gave the shell its own process group, so a real
+            // SIGINT can reach it (and its foreground command) without ever
+            // touching this client.  Pipes keep the byte as a last resort.
+            let signaled = false;
+            if (!IS_WINDOWS && child.pid) {
+              try { process.kill(-child.pid, 'SIGINT'); signaled = true; }
+              catch { /* ignore */ }
+            }
+            if (!signaled && !child.stdin.destroyed) {
               try { child.stdin.write(Buffer.from([0x03])); } catch { /* ignore */ }
             }
             continue;
@@ -4740,37 +4794,63 @@ async function shellUnix(conn, rows, cols) {
     + shSingleQuote(shellPath()) + ' -i';
   const scriptBin = which('script');
   if (scriptBin) {
-    let child = null;
-    const args = IS_DARWIN
-      ? ['-q', '/dev/null', '/bin/sh', '-c', inner]
-      : ['-qfec', inner, '/dev/null'];
-    try {
-      child = require('child_process').spawn(scriptBin, args, {
-        stdio: ['pipe', 'pipe', 'pipe'], env: shellChildEnv(), windowsHide: true,
-      });
-    } catch {
-      child = null;
-    }
-    if (child) {
+    // Every script(1) dialect spells "run this command" differently, and the
+    // differences are exactly why macOS used to fall through to the pipe
+    // shell.  The no-command form comes first because it is the only one
+    // shared by BSD (macOS), GNU and most other script(1) implementations:
+    // script -q /dev/null simply starts an interactive $SHELL inside a real
+    // PTY and relays raw bytes, so the terminal is sized by feeding one
+    // stty line to that shell afterwards.  The two argument forms stay as
+    // follow-ups for systems where the no-command form is not supported.
+    const attempts = [
+      { args: ['-q', '/dev/null'], feedStty: true },
+      { args: ['-q', '/dev/null', '/bin/sh', '-c', inner], feedStty: false },
+      { args: ['-qfec', inner, '/dev/null'], feedStty: false },
+    ];
+    for (let index = 0; index < attempts.length; index += 1) {
+      const attempt = attempts[index];
+      let child = null;
+      try {
+        child = require('child_process').spawn(scriptBin, attempt.args, {
+          stdio: ['pipe', 'pipe', 'pipe'], env: shellChildEnv(), windowsHide: true,
+          // Own process group: a later stop/Ctrl+C signals the script tree
+          // only, never this client (a shared group would make the group
+          // kill in killProcess() take the whole client down).
+          detached: !IS_WINDOWS,
+        });
+      } catch {
+        child = null;
+      }
+      if (!child) continue;
       const spawned = await new Promise((resolve) => {
         let settled = false;
         child.once('spawn', () => { if (!settled) { settled = true; resolve(true); } });
         child.once('error', () => { if (!settled) { settled = true; resolve(false); } });
         setTimeout(() => { if (!settled) { settled = true; resolve(true); } }, 500).unref?.();
       });
-      if (spawned) {
-        // A very fast failure (e.g. an old busybox script without -e) falls
-        // back to the pipe shell instead of leaving a dead channel.
-        const earlyExit = await Promise.race([
-          new Promise((resolve) => child.once('exit', () => resolve(true))),
-          sleep(250).then(() => false),
-        ]);
-        if (!earlyExit) {
-          await bridgeShell(conn, child, 'pty', rows, cols);
-          return;
-        }
+      if (!spawned) {
+        try { child.kill('SIGKILL'); } catch { /* ignore */ }
+        continue;
       }
-      try { child.kill('SIGKILL'); } catch { /* ignore */ }
+      // A very fast failure (an unsupported flag set, a busybox script
+      // without -e, ...) falls through to the next attempt instead of
+      // leaving a dead channel.
+      const earlyExit = await Promise.race([
+        new Promise((resolve) => child.once('exit', () => resolve(true))),
+        sleep(250).then(() => false),
+      ]);
+      if (earlyExit) {
+        try { child.kill('SIGKILL'); } catch { /* ignore */ }
+        continue;
+      }
+      if (attempt.feedStty) {
+        // No-command form: size the PTY from inside by letting the freshly
+        // started interactive shell run one stty line first.
+        try { child.stdin.write('stty rows ' + rows + ' cols ' + cols + '\n'); }
+        catch { /* ignore */ }
+      }
+      await bridgeShell(conn, child, 'pty', rows, cols);
+      return;
     }
   }
   await sendShellOutput(conn,
@@ -4951,10 +5031,17 @@ async function shellPipeMode(conn, rows, cols) {
   } else {
     shell = shellPath();
   }
+  // Unix: -i makes the shell catch SIGINT itself (Ctrl+C interrupts the
+  // running command and the shell keeps going instead of dying), exactly
+  // like the Python client's fallback bridge.  Windows shells take no -i.
+  const args = IS_WINDOWS ? [] : ['-i'];
   let child;
   try {
-    child = require('child_process').spawn(shell, [], {
+    child = require('child_process').spawn(shell, args, {
       stdio: ['pipe', 'pipe', 'pipe'], env: shellChildEnv(), windowsHide: true,
+      // Own process group on Unix: Ctrl+C/stop signals the shell tree only,
+      // never this client, and killProcess() can safely signal the group.
+      detached: !IS_WINDOWS,
     });
   } catch (e) {
     throw new Error('cannot start ' + shell + ': ' + errorText(e));

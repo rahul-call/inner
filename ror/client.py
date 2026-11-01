@@ -403,10 +403,28 @@ def _android_wake_lock(enable):
 
 
 def _shell_executable():
-    """Android has no /bin/sh in the Termux root; use Termux's own sh.
+    """Pick the shell used by the interactive PTY bridge.
+
+    Android has no /bin/sh in the Termux root, so Termux's own sh is used.
+    On macOS the SHELL variable can be missing (a client started from the
+    Finder, a LaunchAgent or a plain `launchctl` job has no shell context),
+    and iOS only offers /bin/sh on jailbroken devices - both get an ordered
+    fallback chain instead of a hardcoded /bin/bash that may not exist.
     Everywhere else None keeps Python's default /bin/sh exactly as before."""
     if is_android():
         return shutil.which('sh') or '/system/bin/sh'
+    if is_ios():
+        for candidate in ('/bin/sh', '/bin/bash', '/bin/zsh'):
+            if os.path.exists(candidate):
+                return candidate
+        return shutil.which('sh') or '/bin/sh'
+    if is_macos():
+        candidates = [os.environ.get('SHELL') or '', '/bin/zsh',
+                      '/bin/bash', '/bin/sh']
+        for candidate in candidates:
+            if candidate and os.path.exists(candidate):
+                return candidate
+        return shutil.which('sh') or '/bin/sh'
     return None
 
 
@@ -3060,6 +3078,147 @@ def _reap_pty_child(pid, grace=2.0):
         deadline = time.time() + 1.0
 
 
+def _shell_pipe(sock, rows, cols):
+    """Line-oriented shell fallback for systems without a usable PTY (iOS,
+    locked-down sandboxes, a missing /dev/ptmx).
+
+    The controller's terminal is raw, so Enter arrives as a bare '\\r'.  A
+    shell reading from a *pipe* (not a terminal) does not strip '\\r' - it
+    would try to execute "cmd\\r" and answer "command not found: ^M", which
+    is exactly the macOS bug.  Every submitted line is therefore echoed
+    locally and forwarded with a single trailing '\\n' and no '\\r'."""
+    import subprocess
+    shell = _shell_executable() or os.environ.get('SHELL') or '/bin/sh'
+    if not os.path.exists(shell):
+        shell = '/bin/sh'
+    popen_kwargs = {}
+    if os.name != 'nt':
+        # Own session -> Ctrl+C can hit the shell's group without ever
+        # touching the client process itself.
+        popen_kwargs['start_new_session'] = True
+    try:
+        proc = subprocess.Popen(
+            [shell, '-i'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, bufsize=0, env=_shell_child_env(),
+            **popen_kwargs)
+    except OSError as exc:
+        _shell_notice(sock, 'could not start {}: {}'.format(shell, exc))
+        return
+    proc_stdin = proc.stdin
+    proc_stdout = proc.stdout
+    line = []
+    last_was_cr = False
+    try:
+        while True:
+            try:
+                readable, _w, _x = select.select([sock, proc_stdout], [], [],
+                                                 0.2)
+            except (OSError, ValueError):
+                break
+            if proc_stdout in readable:
+                try:
+                    data = os.read(proc_stdout.fileno(), 65536)
+                except (OSError, ValueError):
+                    data = b''
+                if not data:
+                    break                       # the shell exited
+                if not _send_shell_output(sock, data):
+                    break                       # the controller is gone
+                continue
+            if sock not in readable:
+                if _shell_pipe_dead(proc):
+                    break
+                continue
+            try:
+                data = sock.recv(65536)
+            except OSError:
+                break
+            if not data:
+                break
+            for value in data:
+                char = bytes((value,))
+                if char in (b'\r', b'\n'):
+                    if char == b'\n' and last_was_cr:
+                        last_was_cr = False     # CRLF counts as one Enter
+                        continue
+                    last_was_cr = (char == b'\r')
+                    command = b''.join(line)
+                    line = []
+                    if not _send_shell_output(sock, b'\r\n'):
+                        break
+                    try:
+                        proc_stdin.write(command + b'\n')
+                        proc_stdin.flush()
+                    except (OSError, ValueError):
+                        break
+                    continue
+                last_was_cr = False
+                if char in (b'\x7f', b'\b'):
+                    if line:
+                        line.pop()
+                        _send_shell_output(sock, b'\b \b')
+                    continue
+                if char == b'\x03':             # Ctrl+C
+                    line = []
+                    _send_shell_output(sock, b'^C\r\n')
+                    if os.name != 'nt':
+                        try:
+                            os.killpg(proc.pid, signal.SIGINT)
+                        except (OSError, AttributeError):
+                            pass
+                    continue
+                if char == b'\x04':             # Ctrl+D
+                    if line:
+                        command = b''.join(line)
+                        line = []
+                        _send_shell_output(sock, b'\r\n')
+                        try:
+                            proc_stdin.write(command + b'\n')
+                            proc_stdin.flush()
+                        except (OSError, ValueError):
+                            break
+                    else:
+                        try:
+                            proc_stdin.close()
+                        except (OSError, ValueError):
+                            pass
+                    continue
+                if value < 0x20 and char != b'\t':
+                    continue                    # other control bytes: ignore
+                line.append(char)
+                _send_shell_output(sock, char)
+    finally:
+        try:
+            proc_stdin.close()
+        except (OSError, ValueError):
+            pass
+        if os.name != 'nt':
+            for sig in (signal.SIGHUP, signal.SIGKILL):
+                try:
+                    os.killpg(proc.pid, sig)
+                except (OSError, AttributeError):
+                    break
+                try:
+                    proc.wait(timeout=1.0)
+                    break
+                except Exception:
+                    pass
+        else:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=1.0)
+            except Exception:
+                pass
+
+
+def _shell_pipe_dead(proc):
+    """True once the fallback shell process has clearly exited."""
+    return proc.poll() is not None
+
+
 def _shell_unix(sock, rows, cols):
     """Bridge a real interactive shell (PTY) to the controller's socket."""
     import fcntl
@@ -3067,7 +3226,15 @@ def _shell_unix(sock, rows, cols):
     import signal
     import termios
 
-    pid, master_fd = pty.fork()
+    try:
+        pid, master_fd = pty.fork()
+    except (ImportError, AttributeError, NotImplementedError, OSError) as exc:
+        # iOS and locked-down sandboxes have no usable PTY.  Degrade to the
+        # line-oriented bridge instead of killing the whole shell session
+        # (the old code let the error escape and 'shell' just died there).
+        _shell_notice(sock, 'no usable PTY here ({}); running a line-oriented '
+                            'shell'.format(exc))
+        return _shell_pipe(sock, rows, cols)
     if pid == 0:
         # Child: drop the socket, make the PTY a sane terminal, exec a shell.
         try:
@@ -4709,15 +4876,15 @@ def _upex_compiler_candidates(app, app_type):
     if app_type == 'c':
         if windows:
             return [
-		_upex_attempt('cl', 'cl /Fe:{} {}'.format(output, app), run),
-		_upex_attempt('gcc', 'gcc {} -o {}'.format(app, output), run)
+                _upex_attempt('cl', 'cl /Fe:{} {}'.format(output, app), run),
+                _upex_attempt('gcc', 'gcc {} -o {}'.format(app, output), run)
             ]
         if android:
             # Termux normally provides clang, but keep the existing gcc-first
             # order and fall back only after a real failure.
             return [
                 _upex_attempt('gcc', 'gcc {} -o {}'.format(app, output), run),
-		_upex_attempt('clang', 'clang {} -o {}'.format(app, output), run)
+                _upex_attempt('clang', 'clang {} -o {}'.format(app, output), run)
             ]
         if mac or ios:
             return [

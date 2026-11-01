@@ -2369,6 +2369,22 @@ making the controller look like a slow receiver."""
         print("[+] Full output saved: {}".format(saved), file=out)
 
 
+def _next_free_path(path):
+    """First unused variant of path: path, path_2, path_3, ...
+
+    Screenshots used to reuse one second-resolution name, so a second shot
+    within the same second silently overwrote the first one.  Explicit user
+    names are never rewritten by this helper - the caller decides."""
+    if not os.path.exists(path):
+        return path
+    stem, ext = os.path.splitext(path)
+    for index in range(2, 10000):
+        candidate = '{}_{}{}'.format(stem, index, ext)
+        if not os.path.exists(candidate):
+            return candidate
+    return path
+
+
 def show_reply(reply, save_as=None, out=None):
     """Print one client reply (the display half of an answer)."""
     out = out or sys.stdout
@@ -2407,7 +2423,11 @@ def show_reply(reply, save_as=None, out=None):
         except Exception as e:
             print("[!] Could not save file: {}".format(e), file=out)
     elif rtype == 'image':
-        name = save_as or time.strftime('screenshot_%Y%m%d_%H%M%S.jpg')
+        # Default screenshots land next to controller.py (the current working
+        # directory), never overwrite each other, and still honour an explicit
+        # "screenshot <name>" argument unchanged.
+        name = save_as or _next_free_path(
+            time.strftime('screenshot_%Y%m%d_%H%M%S.jpg'))
         try:
             data = base64.b64decode(reply.get('data', ''))
             with open(name, 'wb') as f:
@@ -3652,6 +3672,10 @@ Ctrl+Z cancels it on the client."""
             # Transfers always run in the background; the dashboard already
             # gives them their context.  Don't add noise to their final line.
             return text
+        if getattr(self, 'gui', False):
+            # Browser-console commands answer like typed ones; the prompt is
+            # not "waiting" for them anywhere, so the tag would be noise.
+            return text
         if self.background or self.canceled:
             return '[background] {}'.format(text)
         return text
@@ -3979,7 +4003,7 @@ the order their answers arrive in."""
         if self.number is not None and current is not None and current is not self:
             first, sep, rest = text.partition('\n')
             text = '[session {}] {}{}{}'.format(self.number, first, sep, rest)
-        _async_print(text)
+        _gui_note(text)   # terminal (async-safe) + browser, even during a shell
 
     # -- operation bookkeeping -------------------------------------------------
     def add(self, op):
@@ -4234,6 +4258,11 @@ stdin was closed."""
                 continue
             if text:
                 QUEUED_COMMANDS.append(text)
+        # Commands sent from the browser are handled by the GUI dispatcher
+        # thread (started with the dashboard): local commands answer here
+        # through it, the rest waits in the prompt queue for the first client.
+        # This loop no longer touches GUI_PENDING_COMMANDS, so a line is never
+        # consumed twice.
 
 
 def _print_sessions():
@@ -4867,6 +4896,8 @@ Returns False only when the client's main connection is gone."""
 PENDING_INPUT = ''                # type-ahead typed while something was running
 PENDING_LINK = [None]             # which session that type-ahead was meant for
 STOP_REQUEST = threading.Event()  # set by Ctrl+Z (SIGTSTP) while something runs
+DISPATCH_LOCK = threading.Lock()   # one command at a time: terminal or browser
+REPL_DISPATCHING = False           # the terminal prompt is inside a command
 WAKEUP_R = WAKEUP_W = None        # self-pipe: makes select() obey Ctrl+Z instantly
 OP_R = OP_W = None                # self-pipe: the reader thread wakes the prompt
 
@@ -5037,6 +5068,7 @@ instead of being executed on the replacement session."""
         text = QUEUED_COMMANDS.pop(0)
         print("{}{}".format(prompt, text))
         return text
+    PROMPT_ACTIVE = True
     while PENDING_INPUT:
         line, sep, rest = PENDING_INPUT.partition('\n')
         if not sep:
@@ -5212,13 +5244,33 @@ def _handle_keys(typed, op, cancelable=True, backgroundable=True):
         op.detach()
 
 
+def _wait_op_quiet(op):
+    """Wait for one operation without touching the keyboard.
+
+Used whenever an operation is started from a background thread (the browser
+dashboard's command dispatcher, a GUI worker): those threads must never put
+the shared terminal into cbreak mode or read its stdin - only the prompt
+thread owns the keyboard. Ctrl+B/Ctrl+Z/type-ahead are terminal features;
+background threads simply wait for the answer."""
+    link = op.link
+    while not op.done.is_set() and not op.background and not link.dead:
+        time.sleep(0.05)
+    if link.dead:
+        return 'dead'
+    if op.background:
+        return 'background'
+    return 'done'
+
+
 def wait_foreground(op, cancelable=True, backgroundable=True):
-    """Wait for one operation while staying responsive to the keyboard:
-  Ctrl+B -> move it to the background (the prompt comes back),
-  Ctrl+Z -> stop it on the client and come back to the prompt,
-  anything else -> type-ahead for the next prompt.
-Returns 'done', 'background' (it keeps running as a background job) or
-'dead' (the client is gone)."""
+    """Send one request and wait for its answer.
+
+Returns 'done', 'background' (it is still running - the prompt is free
+again) or 'dead'.  Called from a thread other than the prompt thread (the
+browser GUI dispatcher), it waits quietly instead of taking over the
+keyboard."""
+    if threading.current_thread() is not threading.main_thread():
+        return _wait_op_quiet(op)
     link = op.link
     STOP_REQUEST.clear()
     _drain_wakeup()
@@ -5974,369 +6026,376 @@ def serve(link):
             continue
         STOP_REQUEST.clear()
 
-        # The session may have ended (or another one may have become active)
-        # while the prompt was waiting for Enter. Never send that command to
-        # a different machine by accident.
-        if link.dead or _active_link() is not link:
-            if _active_link() is None:
-                print("[!] The active session disconnected while you were typing - "
-                      "that command was not run. Waiting for a client...")
-            else:
-                print("[!] The active session changed while you were typing - that "
-                      "command was not run. Please type it again.")
-            return False
-
-        if _handle_local_command(line):
-            continue                # options/help are answered here, never sent
-
-        if line == 'upex' or line.startswith('upex '):
-            if _run_upex(link, line) == 'dead':
-                return False
-            continue
-
-        if line in ('exit', 'quit'):
-            # Controller-only, exactly like Ctrl+C: every client stays alive
-            # and keeps reconnecting. 'exit session ...' is what stops clients.
-            print("[+] Leaving the controller - every client keeps running and "
-                  "reconnects when this controller is back.")
+        global REPL_DISPATCHING
+        with DISPATCH_LOCK:
+            REPL_DISPATCHING = True
+            try:
+                outcome = _serve_one_command(link, line)
+            finally:
+                REPL_DISPATCHING = False
+        if outcome == 'leave':
             return True
-
-        if line.startswith(('exit session', 'quit session')):
-            parts = split_args(line)
-            target = parts[2] if len(parts) == 3 else None
-            if target is None:
-                print("[!] Usage: exit session <number> | exit session all   "
-                      "('session' lists them)")
-                continue
-            if target.lower() == 'all':
-                _stop_all_sessions()
-                _settle_dying_prompt(link)
-                continue
-            if not target.isdigit():
-                print("[!] '{}' is not a session number - use one from 'session', "
-                      "or 'exit session all'.".format(target))
-                continue
-            number = int(target)
-            with SESSIONS_COND:
-                stopped_link = SESSIONS.get(number)
-            if stopped_link is None or stopped_link.dead:
-                print("[!] No session {}. Type 'session' to list them.".format(number))
-                continue
-            op = _send_exit_request(stopped_link, number)
-            if op is None:
-                print("[!] Session {} disconnected while it was being stopped.".format(number))
-                continue
-            if _wait_stopped([(stopped_link, op)], 3.0):
-                print("[+] Session {} stopped - its client exited and will not "
-                      "reconnect.".format(number))
-            else:
-                print("[+] Stop requested for session {} - its client will exit "
-                      "as soon as it can.".format(number))
-            if stopped_link is link:
-                _settle_dying_prompt(link)
-            continue
-
-        # -- sessions (controller-side, never sent to the client) -----------
-        if line == 'session':
-            _print_sessions()
-            continue
-
-        if line.startswith('session '):
-            # 'session <number>' switches directly after 'session' listed them.
-            parts = split_args(line)
-            target = parts[1] if len(parts) > 1 else ''
-            if len(parts) == 2 and target.isdigit():
-                new_link, error = _switch_session(int(target))
-                if error:
-                    print(error)
-                    continue
-                if new_link is link:
-                    print("[+] Already on session {}.".format(target))
-                    continue
-                print("[+] Active session is now {} - {} ({}).".format(
-                    int(target), _session_env_label(new_link), _fmt_addr(new_link.addr)))
-                return False            # the caller serves the new session
-            print("[!] Usage: session <number>   ('session' lists them)")
-            continue
-
-        if line == 'connect' or line.startswith('connect '):
-            parts = line.split()
-            target = None
-            if len(parts) >= 2 and parts[1].lower() == 'session':
-                if len(parts) != 3:
-                    print("[!] Usage: connect session <number>   ('session' lists them)")
-                    continue
-                target = parts[2]
-            elif len(parts) == 2 and parts[1].isdigit():
-                target = parts[1]           # 'connect 2' works too
-            elif len(parts) == 1:
-                print("[!] Usage: connect session <number>   ('session' lists them)")
-                continue
-            if target is not None:
-                try:
-                    number = int(target)
-                except ValueError:
-                    print("[!] '{}' is not a session number. Type 'session' to "
-                          "list them.".format(target))
-                    continue
-                new_link, error = _switch_session(number)
-                if error:
-                    print(error)
-                    continue
-                if new_link is link:
-                    print("[+] Already on session {}.".format(number))
-                    continue
-                print("[+] Active session is now {} - {} ({}).".format(
-                    number, _session_env_label(new_link), _fmt_addr(new_link.addr)))
-                return False            # the caller serves the new session
-            # any other 'connect ...' is just a shell command for the client
-
-        if line in ('jobs', 'ps'):
-            _print_jobs(link)
-            continue
-
-        if line == 'cancel' or line.startswith('cancel '):
-            _cancel_transfers(link, line.split(None, 1)[1] if ' ' in line else '')
-            continue
-
-        if line == 'stop' or line.startswith('stop '):
-            parts = split_args(line)
-            _stop_jobs(link, parts[1] if len(parts) > 1 else None)
-            continue
-
-        if line.startswith(('downloaddir ', 'download-dir ',
-                            'downloadfolder ', 'download-folder ')):
-            line = 'download ' + line.split(None, 1)[1]
-        if line == 'download' or line.startswith('download '):
-            background = False
-            stripped = line.rstrip()
-            if stripped.endswith('&'):
-                background = True
-                line = stripped[:-1].rstrip()
-            parts = split_args(line)
-            if len(parts) < 2:
-                print("[!] Usage: download <client_path> [save_as] [&]")
-                print("    Or:    download --multi <path1> <path2> ... [&]")
-                print("    A file or a whole folder is detected automatically.")
-                continue
-            requests = []
-            if parts[1] in ('--multi', '--many'):
-                remote_paths = parts[2:]
-                if not remote_paths:
-                    print("[!] Usage: download --multi <path1> <path2> ...")
-                    continue
-                requests = [(path, None) for path in remote_paths]
-            elif len(parts) > 3:
-                # Three or more args are several remote paths (use quotes for
-                # paths containing spaces).  Exactly two keeps save_as.
-                requests = [(path, None) for path in parts[1:]]
-            else:
-                requests = [(parts[1], parts[2] if len(parts) > 2 else None)]
-            started = []
-            for remote_path, save_as in requests:
-                op = Op('download', next_request_id(),
-                        label='download {}'.format(remote_path),
-                        save_as=save_as)
-                op.transfer_serial = next(TRANSFER_SERIAL)
-                op.transfer_name = os.path.basename(
-                    remote_path.rstrip('/\\')) or remote_path
-                op.transfer_status = 'scanning'
-                # Transfers always run in the background: the prompt comes
-                # back immediately and the live dashboard shows progress.
-                op.background = True
-                request = {'type': 'download', 'path': remote_path,
-                           'recursive': True, 'stream': True, 'id': op.id}
-                link.add(op)
-                try:
-                    link.send(request)
-                except OSError:
-                    link.drop(op)
-                    link.mark_lost()
-                    return False
-                print("[+] Preparing download {}...".format(remote_path))
-                started.append(op)
-            if started:
-                _live_start()
-                print("[+] {} download(s) started; the prompt is free. "
-                      "Use 'cancel' to list or stop them.".format(
-                          len(started)))
-            continue
-
-        if line.startswith(('uploaddir ', 'upload-dir ',
-                            'uploadfolder ', 'upload-folder ')):
-            line = 'upload ' + line.split(None, 1)[1]
-        if line == 'upload' or line.startswith('upload '):
-            background = False
-            stripped = line.rstrip()
-            if stripped.endswith('&'):
-                background = True
-                line = stripped[:-1].rstrip()
-            parts = split_args(line)
-            if len(parts) < 2:
-                print("[!] Usage: upload <local_path> [<more> ...] [--as <name>] [&]")
-                print("    Files and whole folders are detected automatically;")
-                print("    every file and folder uses the unlimited streamed protocol.")
-                continue
-            remote_name = None
-            if '--as' in parts:
-                index = parts.index('--as')
-                if index + 2 != len(parts):
-                    print("[!] Usage: upload <local_path> --as <remote_name>")
-                    continue
-                remote_name = parts[index + 1]
-                parts = parts[:index]
-            if len(parts) < 2:
-                print("[!] Usage: upload <local_path> [--as <remote_name>]")
-                continue
-            tokens = parts[1:]
-
-            def _coalesce_paths(items):
-                """Join unquoted tokens that together name an existing path.
-
-                This keeps 'upload /path/with space/file' working while
-                'upload a b' still means two paths.  Quoted paths already
-                arrive as one token from split_args().
-                """
-                if not items:
-                    return []
-                if all(os.path.exists(os.path.expanduser(t)) for t in items):
-                    return items
-                result = []
-                index = 0
-                while index < len(items):
-                    found = None
-                    for end in range(len(items), index, -1):
-                        candidate = ' '.join(items[index:end])
-                        if os.path.exists(os.path.expanduser(candidate)):
-                            found = candidate
-                            index = end
-                            break
-                    if found is None:
-                        result.append(items[index])
-                        index += 1
-                    else:
-                        result.append(found)
-                return result
-
-            tokens = _coalesce_paths(tokens)
-            expanded = []
-            missing = []
-            for token in tokens:
-                token = os.path.expanduser(token)
-                if any(ch in token for ch in '*?['):
-                    matches = sorted(glob.glob(token))
-                    if matches:
-                        expanded.extend(matches)
-                    else:
-                        missing.append(token)
-                    continue
-                expanded.append(token)
-            if missing:
-                print("[!] Not found: {}".format(', '.join(missing)))
-            if not expanded:
-                continue
-            if remote_name is not None and len(expanded) != 1:
-                print("[!] --as can only be used with one file or folder.")
-                continue
-            # Start each scan in its own worker as well.  The prompt returns
-            # before a giant folder has even been walked, and 'cancel' can
-            # stop the scan or the transfer.  The live dashboard shows the
-            # row as 'scanning' until the totals are known.
-            started = []
-            for local_path in expanded:
-                if not os.path.exists(local_path):
-                    print("[!] Could not read local path: {} (no such file or folder)"
-                          .format(local_path))
-                    continue
-                initial_name = remote_name or os.path.basename(
-                    os.path.abspath(local_path).rstrip(os.sep)) or local_path
-                op = Op('upload', next_request_id(),
-                        label='upload {}'.format(local_path))
-                op.transfer_serial = next(TRANSFER_SERIAL)
-                op.transfer_name = initial_name
-                op.transfer_kind = ('folder' if os.path.isdir(local_path)
-                                    else 'file')
-                op.transfer_status = 'scanning'
-                op.background = True
-                link.add(op)
-                print("[+] Preparing upload {}...".format(local_path))
-                threading.Thread(target=_upload_transfer,
-                                 args=(link, op, local_path, remote_name),
-                                 name='upload-transfer', daemon=True).start()
-                started.append(op)
-            if started:
-                _live_start()
-                print("[+] {} upload(s) started; the prompt is free. "
-                      "Use 'cancel' to list or stop them.".format(
-                          len(started)))
-            continue
-
-        if line == 'screenshot' or line.startswith('screenshot '):
-            parts = split_args(line)
-            save_as = parts[1] if len(parts) > 1 else None
-            if save_as and '.' not in os.path.basename(save_as):
-                save_as += '.jpg'
-            op = Op('screenshot', next_request_id(), label='screenshot', save_as=save_as)
-            if ask(link, op, {'type': 'screenshot'}) == 'dead':
-                return False
-            continue
-
-        if line in ('persist', 'unpersist'):
-            op = Op('simple', next_request_id(), label=line)
-            if ask(link, op, {'type': line}, cancelable=False, backgroundable=False) == 'dead':
-                return False
-            continue
-
-        if line == 'shell':
-            try:
-                if not start_interactive_shell(link):
-                    return False
-            except OSError as e:
-                print("[!] Connection lost: {}".format(e))
-                return False
-            continue
-
-        if line == 'screenshare' or line.startswith('screenshare '):
-            parts = split_args(line)
-            fps = None
-            seconds = None
-            if len(parts) > 1:
-                try:
-                    fps = int(parts[1])
-                except ValueError:
-                    fps = None
-            if len(parts) > 2:
-                try:
-                    seconds = float(parts[2])
-                    if seconds <= 0:
-                        seconds = None
-                except ValueError:
-                    seconds = None
-            _retire_screenshares(link)
-            viewer = BrowserViewer()
-            try:
-                viewer.start()
-            except Exception as e:
-                print("[!] Could not start the local viewer: {}".format(e))
-                continue
-            op = Op('screenshare', next_request_id(), label='screenshare')
-            op.seconds = seconds
-            op.viewer = viewer
-            request = {'type': 'screenshare'}
-            if fps:
-                request['fps'] = fps
-            print("[+] Waiting for the first frame from the client...")
-            status = ask(link, op, request)
-            if status == 'dead':
-                viewer.stop()
-                return False
-            continue
-
-        # anything else is a shell command for the client
-        label = line if len(line) <= 60 else line[:57] + '...'
-        op = Op('cmd', next_request_id(), label=label)
-        if ask(link, op, {'type': 'cmd', 'data': line}) == 'dead':
+        if outcome == 'rescan':
             return False
+
+def _serve_one_command(link, line):
+    """Run one submitted command line against `link`.
+
+    This is the single dispatch table behind BOTH front ends: the terminal
+    prompt (serve() below) and the browser console (the GUI dispatcher).
+    Returns:
+        'keep'   - done; keep serving this session,
+        'rescan' - the active session changed or died; the caller re-checks,
+        'leave'  - the user asked to leave the controller (exit/quit).
+    """
+    # The session may have ended (or another one may have become active)
+    # while the prompt was waiting for Enter. Never send that command to
+    # a different machine by accident.
+    if link.dead or _active_link() is not link:
+        if _active_link() is None:
+            print("[!] The active session disconnected while you were typing - "
+                  "that command was not run. Waiting for a client...")
+        else:
+            print("[!] The active session changed while you were typing - that "
+                  "command was not run. Please type it again.")
+        return 'rescan'
+    if _handle_local_command(line):
+        return 'keep'              # options/help are answered here, never sent
+
+    if line == 'upex' or line.startswith('upex '):
+        if _run_upex(link, line) == 'dead':
+            return 'rescan'
+        return 'keep'
+    if line in ('exit', 'quit'):
+        # Controller-only, exactly like Ctrl+C: every client stays alive
+        # and keeps reconnecting. 'exit session ...' is what stops clients.
+        print("[+] Leaving the controller - every client keeps running and "
+              "reconnects when this controller is back.")
+        return 'leave'
+    if line.startswith(('exit session', 'quit session')):
+        parts = split_args(line)
+        target = parts[2] if len(parts) == 3 else None
+        if target is None:
+            print("[!] Usage: exit session <number> | exit session all   "
+                  "('session' lists them)")
+            return 'keep'
+        if target.lower() == 'all':
+            _stop_all_sessions()
+            _settle_dying_prompt(link)
+            return 'keep'
+        if not target.isdigit():
+            print("[!] '{}' is not a session number - use one from 'session', "
+                  "or 'exit session all'.".format(target))
+            return 'keep'
+        number = int(target)
+        with SESSIONS_COND:
+            stopped_link = SESSIONS.get(number)
+        if stopped_link is None or stopped_link.dead:
+            print("[!] No session {}. Type 'session' to list them.".format(number))
+            return 'keep'
+        op = _send_exit_request(stopped_link, number)
+        if op is None:
+            print("[!] Session {} disconnected while it was being stopped.".format(number))
+            return 'keep'
+        if _wait_stopped([(stopped_link, op)], 3.0):
+            print("[+] Session {} stopped - its client exited and will not "
+                  "reconnect.".format(number))
+        else:
+            print("[+] Stop requested for session {} - its client will exit "
+                  "as soon as it can.".format(number))
+        if stopped_link is link:
+            _settle_dying_prompt(link)
+        return 'keep'
+    # -- sessions (controller-side, never sent to the client) -----------
+    if line == 'session':
+        _print_sessions()
+        return 'keep'
+    if line.startswith('session '):
+        # 'session <number>' switches directly after 'session' listed them.
+        parts = split_args(line)
+        target = parts[1] if len(parts) > 1 else ''
+        if len(parts) == 2 and target.isdigit():
+            new_link, error = _switch_session(int(target))
+            if error:
+                print(error)
+                return 'keep'
+            if new_link is link:
+                print("[+] Already on session {}.".format(target))
+                return 'keep'
+            print("[+] Active session is now {} - {} ({}).".format(
+                int(target), _session_env_label(new_link), _fmt_addr(new_link.addr)))
+            return 'rescan'            # the caller serves the new session
+        print("[!] Usage: session <number>   ('session' lists them)")
+        return 'keep'
+    if line == 'connect' or line.startswith('connect '):
+        parts = line.split()
+        target = None
+        if len(parts) >= 2 and parts[1].lower() == 'session':
+            if len(parts) != 3:
+                print("[!] Usage: connect session <number>   ('session' lists them)")
+                return 'keep'
+            target = parts[2]
+        elif len(parts) == 2 and parts[1].isdigit():
+            target = parts[1]           # 'connect 2' works too
+        elif len(parts) == 1:
+            print("[!] Usage: connect session <number>   ('session' lists them)")
+            return 'keep'
+        if target is not None:
+            try:
+                number = int(target)
+            except ValueError:
+                print("[!] '{}' is not a session number. Type 'session' to "
+                      "list them.".format(target))
+                return 'keep'
+            new_link, error = _switch_session(number)
+            if error:
+                print(error)
+                return 'keep'
+            if new_link is link:
+                print("[+] Already on session {}.".format(number))
+                return 'keep'
+            print("[+] Active session is now {} - {} ({}).".format(
+                number, _session_env_label(new_link), _fmt_addr(new_link.addr)))
+            return 'rescan'            # the caller serves the new session
+        # any other 'connect ...' is just a shell command for the client
+
+    if line in ('jobs', 'ps'):
+        _print_jobs(link)
+        return 'keep'
+    if line == 'cancel' or line.startswith('cancel '):
+        _cancel_transfers(link, line.split(None, 1)[1] if ' ' in line else '')
+        return 'keep'
+    if line == 'stop' or line.startswith('stop '):
+        parts = split_args(line)
+        _stop_jobs(link, parts[1] if len(parts) > 1 else None)
+        return 'keep'
+    if line.startswith(('downloaddir ', 'download-dir ',
+                        'downloadfolder ', 'download-folder ')):
+        line = 'download ' + line.split(None, 1)[1]
+    if line == 'download' or line.startswith('download '):
+        background = False
+        stripped = line.rstrip()
+        if stripped.endswith('&'):
+            background = True
+            line = stripped[:-1].rstrip()
+        parts = split_args(line)
+        if len(parts) < 2:
+            print("[!] Usage: download <client_path> [save_as] [&]")
+            print("    Or:    download --multi <path1> <path2> ... [&]")
+            print("    A file or a whole folder is detected automatically.")
+            return 'keep'
+        requests = []
+        if parts[1] in ('--multi', '--many'):
+            remote_paths = parts[2:]
+            if not remote_paths:
+                print("[!] Usage: download --multi <path1> <path2> ...")
+                return 'keep'
+            requests = [(path, None) for path in remote_paths]
+        elif len(parts) > 3:
+            # Three or more args are several remote paths (use quotes for
+            # paths containing spaces).  Exactly two keeps save_as.
+            requests = [(path, None) for path in parts[1:]]
+        else:
+            requests = [(parts[1], parts[2] if len(parts) > 2 else None)]
+        started = []
+        for remote_path, save_as in requests:
+            op = Op('download', next_request_id(),
+                    label='download {}'.format(remote_path),
+                    save_as=save_as)
+            op.transfer_serial = next(TRANSFER_SERIAL)
+            op.transfer_name = os.path.basename(
+                remote_path.rstrip('/\\')) or remote_path
+            op.transfer_status = 'scanning'
+            # Transfers always run in the background: the prompt comes
+            # back immediately and the live dashboard shows progress.
+            op.background = True
+            request = {'type': 'download', 'path': remote_path,
+                       'recursive': True, 'stream': True, 'id': op.id}
+            link.add(op)
+            try:
+                link.send(request)
+            except OSError:
+                link.drop(op)
+                link.mark_lost()
+                return 'rescan'
+            print("[+] Preparing download {}...".format(remote_path))
+            started.append(op)
+        if started:
+            _live_start()
+            print("[+] {} download(s) started; the prompt is free. "
+                  "Use 'cancel' to list or stop them.".format(
+                      len(started)))
+        return 'keep'
+    if line.startswith(('uploaddir ', 'upload-dir ',
+                        'uploadfolder ', 'upload-folder ')):
+        line = 'upload ' + line.split(None, 1)[1]
+    if line == 'upload' or line.startswith('upload '):
+        background = False
+        stripped = line.rstrip()
+        if stripped.endswith('&'):
+            background = True
+            line = stripped[:-1].rstrip()
+        parts = split_args(line)
+        if len(parts) < 2:
+            print("[!] Usage: upload <local_path> [<more> ...] [--as <name>] [&]")
+            print("    Files and whole folders are detected automatically;")
+            print("    every file and folder uses the unlimited streamed protocol.")
+            return 'keep'
+        remote_name = None
+        if '--as' in parts:
+            index = parts.index('--as')
+            if index + 2 != len(parts):
+                print("[!] Usage: upload <local_path> --as <remote_name>")
+                return 'keep'
+            remote_name = parts[index + 1]
+            parts = parts[:index]
+        if len(parts) < 2:
+            print("[!] Usage: upload <local_path> [--as <remote_name>]")
+            return 'keep'
+        tokens = parts[1:]
+
+        def _coalesce_paths(items):
+            """Join unquoted tokens that together name an existing path.
+
+            This keeps 'upload /path/with space/file' working while
+            'upload a b' still means two paths.  Quoted paths already
+            arrive as one token from split_args().
+            """
+            if not items:
+                return []
+            if all(os.path.exists(os.path.expanduser(t)) for t in items):
+                return items
+            result = []
+            index = 0
+            while index < len(items):
+                found = None
+                for end in range(len(items), index, -1):
+                    candidate = ' '.join(items[index:end])
+                    if os.path.exists(os.path.expanduser(candidate)):
+                        found = candidate
+                        index = end
+                        break
+                if found is None:
+                    result.append(items[index])
+                    index += 1
+                else:
+                    result.append(found)
+            return result
+
+        tokens = _coalesce_paths(tokens)
+        expanded = []
+        missing = []
+        for token in tokens:
+            token = os.path.expanduser(token)
+            if any(ch in token for ch in '*?['):
+                matches = sorted(glob.glob(token))
+                if matches:
+                    expanded.extend(matches)
+                else:
+                    missing.append(token)
+                return 'keep'
+            expanded.append(token)
+        if missing:
+            print("[!] Not found: {}".format(', '.join(missing)))
+        if not expanded:
+            return 'keep'
+        if remote_name is not None and len(expanded) != 1:
+            print("[!] --as can only be used with one file or folder.")
+            return 'keep'
+        # Start each scan in its own worker as well.  The prompt returns
+        # before a giant folder has even been walked, and 'cancel' can
+        # stop the scan or the transfer.  The live dashboard shows the
+        # row as 'scanning' until the totals are known.
+        started = []
+        for local_path in expanded:
+            if not os.path.exists(local_path):
+                print("[!] Could not read local path: {} (no such file or folder)"
+                      .format(local_path))
+                return 'keep'
+            initial_name = remote_name or os.path.basename(
+                os.path.abspath(local_path).rstrip(os.sep)) or local_path
+            op = Op('upload', next_request_id(),
+                    label='upload {}'.format(local_path))
+            op.transfer_serial = next(TRANSFER_SERIAL)
+            op.transfer_name = initial_name
+            op.transfer_kind = ('folder' if os.path.isdir(local_path)
+                                else 'file')
+            op.transfer_status = 'scanning'
+            op.background = True
+            link.add(op)
+            print("[+] Preparing upload {}...".format(local_path))
+            threading.Thread(target=_upload_transfer,
+                             args=(link, op, local_path, remote_name),
+                             name='upload-transfer', daemon=True).start()
+            started.append(op)
+        if started:
+            _live_start()
+            print("[+] {} upload(s) started; the prompt is free. "
+                  "Use 'cancel' to list or stop them.".format(
+                      len(started)))
+        return 'keep'
+    if line == 'screenshot' or line.startswith('screenshot '):
+        parts = split_args(line)
+        save_as = parts[1] if len(parts) > 1 else None
+        if save_as and '.' not in os.path.basename(save_as):
+            save_as += '.jpg'
+        op = Op('screenshot', next_request_id(), label='screenshot', save_as=save_as)
+        if ask(link, op, {'type': 'screenshot'}) == 'dead':
+            return 'rescan'
+        return 'keep'
+    if line in ('persist', 'unpersist'):
+        op = Op('simple', next_request_id(), label=line)
+        if ask(link, op, {'type': line}, cancelable=False, backgroundable=False) == 'dead':
+            return 'rescan'
+        return 'keep'
+    if line == 'shell':
+        try:
+            if not start_interactive_shell(link):
+                return 'rescan'
+        except OSError as e:
+            print("[!] Connection lost: {}".format(e))
+            return 'rescan'
+        return 'keep'
+    if line == 'screenshare' or line.startswith('screenshare '):
+        parts = split_args(line)
+        fps = None
+        seconds = None
+        if len(parts) > 1:
+            try:
+                fps = int(parts[1])
+            except ValueError:
+                fps = None
+        if len(parts) > 2:
+            try:
+                seconds = float(parts[2])
+                if seconds <= 0:
+                    seconds = None
+            except ValueError:
+                seconds = None
+        _retire_screenshares(link)
+        viewer = BrowserViewer()
+        try:
+            viewer.start()
+        except Exception as e:
+            print("[!] Could not start the local viewer: {}".format(e))
+            return 'keep'
+        op = Op('screenshare', next_request_id(), label='screenshare')
+        op.seconds = seconds
+        op.viewer = viewer
+        request = {'type': 'screenshare'}
+        if fps:
+            request['fps'] = fps
+        print("[+] Waiting for the first frame from the client...")
+        status = ask(link, op, request)
+        if status == 'dead':
+            viewer.stop()
+            return 'rescan'
+        return 'keep'
+    # anything else is a shell command for the client
+    label = line if len(line) <= 60 else line[:57] + '...'
+    op = Op('cmd', next_request_id(), label=label)
+    if ask(link, op, {'type': 'cmd', 'data': line}) == 'dead':
+        return 'rescan'
 
 
 class PrefixSocket(object):
@@ -6721,6 +6780,3721 @@ def _accept_loop(server_socket, tls_context=None):
                 pass
 
 
+# ---------------------------------------------------------------------------
+# Web GUI — the interactive control center
+#
+# A full browser front end for this controller.  Every feature the terminal
+# has is clickable there: sessions switch with a click (the controller runs
+# the very same 'session <id>' switch under the hood), the file browser
+# silently runs listing commands on the client and shows files/folders
+# (hidden ones included), a little icon on every row downloads it with the
+# normal streamed transfer and hands the file to the browser, drag & drop
+# uploads run the normal 'upload' pipeline, Upload & Execute runs 'upex',
+# the screenshot button captures the client's screen right into the page,
+# the screen share opens as a live MJPEG view in its own tab, and the shell
+# tab is a real interactive PTY on the same authenticated second channel the
+# terminal 'shell' command uses.
+#
+# Nothing here invents a new client protocol: the GUI presses the same
+# buttons the prompt does, only invisibly.  The terminal keeps working
+# exactly as before, side by side.
+#
+# Enabled by default on http://127.0.0.1:8080 (npm start / python3
+# controller.py).  --no-gui turns it off; --gui-port / --gui-host /
+# --gui-token adjust it.
+# ---------------------------------------------------------------------------
+
+GUI_SETTINGS = {'enabled': True, 'host': '127.0.0.1', 'port': 8080,
+                'token': ''}
+GUI_STATE = None                  # GuiDashboard, created by start_gui_dashboard()
+GUI_PENDING_COMMANDS = []         # browser-submitted commands, waiting
+GUI_CMD_LOCK = threading.Lock()
+GUI_CMD_COND = threading.Condition()   # wakes the browser-command dispatcher
+
+
+def _gui_term_text(text):
+    """Sanitize raw shell output for the browser terminal model.
+
+    Colour and OSC escapes are dropped, but the two redraw escapes shells
+    actually use are re-injected as single control sentinels the page
+    understands: \\x01 = EL (cut the line at the cursor), \\x02 = ED (clear
+    the screen).  \\r, \\b and \\t survive verbatim - they are what makes
+    echo, backspace and column-aligned output behave like a real terminal
+    instead of one div per network chunk."""
+    if '\x1b' in text:
+        for el in ('\x1b[0K', '\x1b[K'):
+            text = text.replace(el, '\x01')
+        for ed in ('\x1b[0J', '\x1b[J', '\x1b[1J', '\x1b[2J'):
+            text = text.replace(ed, '\x02')
+    return _gui_ansi_strip(text).replace('\x00', '')
+
+
+def _gui_ansi_strip(text):
+    """Remove ANSI/OSC escape sequences so browser text stays readable."""
+    if '\x1b' not in text:
+        return text.replace('\x00', '')
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '\x1b' and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt == '[':                      # CSI ... final byte
+                i += 2
+                while i < n and not ('@' <= text[i] <= '~'):
+                    i += 1
+                i += 1
+                continue
+            if nxt == ']':                      # OSC ... BEL or ST
+                i += 2
+                while i < n:
+                    if text[i] == '\x07':
+                        i += 1
+                        break
+                    if text[i] == '\x1b' and i + 1 < n and text[i + 1] == '\\':
+                        i += 2
+                        break
+                    i += 1
+                continue
+            i += 2                              # two-byte escape (ESC 7, ESC c...)
+            continue
+        out.append(ch)
+        i += 1
+    return ''.join(out).replace('\x00', '')
+
+
+class GuiShell(object):
+    """One interactive remote shell driven from the browser.
+
+    It uses the same authenticated second connection as the terminal shell
+    (the client dials back with the CMON2 SHELL token), so the client needs no
+    new protocol at all - and the controller's own terminal shell keeps
+    working independently while a browser shell runs."""
+
+    def __init__(self, dashboard):
+        self.dashboard = dashboard
+        self.lock = threading.Lock()
+        self.conn = None
+        self.client_os = ''
+        self.out = []
+        self._pend = b''                # a UTF-8 character split mid-chunk
+        self.version = 1
+
+    def snapshot(self):
+        with self.lock:
+            return {'active': self.conn is not None,
+                    'client_os': self.client_os,
+                    'tail': self.out[-300:],
+                    'version': self.version}
+
+    def write_out(self, data):
+        """Shell output -> the browser terminal.
+
+        The text keeps its \r / \b / \t control characters: the page's
+        terminal model needs them to echo keystrokes on one line, fix typos
+        and align columns instead of stacking every chunk on its own line.
+        A multi-byte character split across two recv() chunks is held back
+        until its tail arrives, so UTF-8 never turns into '?' pairs."""
+        data = bytes(data)
+        if self._pend:
+            data = self._pend + data
+            self._pend = b''
+        while data:
+            try:
+                text = data.decode('utf-8')
+                data = b''
+            except UnicodeDecodeError as exc:
+                start = exc.start
+                if not start and len(data) <= 3:
+                    self._pend = data          # a character's first bytes only
+                    return
+                if start and start >= len(data) - 3:
+                    text = data[:start].decode('utf-8', 'replace')
+                    self._pend = data[start:]  # truncated tail: wait for more
+                    data = b''
+                    if len(self._pend) > 4:    # garbage must never wedge us
+                        text += self._pend.decode('utf-8', 'replace')
+                        self._pend = b''
+                else:
+                    text = data[:start + 1].decode('utf-8', 'replace')
+                    data = data[start + 1:]
+            if not text:
+                continue
+            text = _gui_term_text(text)
+            if not text:
+                continue
+            with self.lock:
+                self.out.append(text)
+                if len(self.out) > 800:
+                    del self.out[:len(self.out) - 800]
+                self.version += 1
+            self.dashboard.publish({'kind': 'shell_out', 'data': text})
+
+    def write_in(self, data):
+        """Keystrokes from the browser towards the client's PTY."""
+        with self.lock:
+            conn = self.conn
+        if conn is None:
+            return False
+        try:
+            conn.sendall(bytes(data))
+            return True
+        except OSError:
+            return False
+
+    def attach(self, conn, client_os):
+        with self.lock:
+            self.conn = conn
+            self.client_os = client_os or ''
+            self.out = []
+            self._pend = b''
+            self.version += 1
+
+    def detach(self):
+        with self.lock:
+            self.conn = None
+            self._pend = b''
+            self.version += 1
+
+    def stop(self):
+        with self.lock:
+            conn = self.conn
+        if conn is None:
+            return False
+        try:
+            conn.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            conn.close()
+        except OSError:
+            pass
+        return True
+
+
+class GuiDashboard(object):
+    """Shared browser state: the event log, session snapshots, GUI-started
+downloads (served back to the browser when ready), screenshots, and the
+live event stream (SSE) the page listens on."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.logs = []                    # capped list of complete lines
+        self.version = 1
+        self.pending = ''                 # partial line not yet newline-ended
+        self.subscribers = []
+        self.shell = GuiShell(self)
+        self.started_at = time.time()
+        # -- interactive GUI extras ----------------------------------------
+        self.dl = {}                      # download id -> record dict
+        self.dl_seq = itertools.count(1)
+        self.shots = []                   # newest screenshot first
+        self.shot_lock = threading.Lock()
+        self.shot_busy = threading.Lock()
+        self.shot_seq = itertools.count(1)   # unique ids even in the same ms
+        self.screen_lock = threading.Lock()
+        self.screen_op = None             # the GUI-started screenshare Op
+        self._tmp = None
+        self._tmp_lock = threading.Lock()
+        try:
+            atexit.register(self._cleanup_tmp)
+        except Exception:
+            pass
+
+    def tmp_dir(self):
+        """One scratch folder for everything the GUI moves around."""
+        with self._tmp_lock:
+            if self._tmp is None:
+                try:
+                    self._tmp = tempfile.mkdtemp(prefix='cmon_gui_')
+                except OSError:
+                    self._tmp = os.path.join(tempfile.gettempdir(), 'cmon_gui')
+                    try:
+                        os.makedirs(self._tmp, exist_ok=True)
+                    except OSError:
+                        pass
+            return self._tmp
+
+    def _cleanup_tmp(self):
+        path = self._tmp
+        if not path:
+            return
+        try:
+            shutil.rmtree(path, ignore_errors=True)
+        except Exception:
+            pass
+
+    # -- terminal log feed ---------------------------------------------------
+    def feed_text(self, text):
+        if not text:
+            return
+        lines = []
+        with self.lock:
+            self.pending += str(text)
+            while '\n' in self.pending:
+                line, _sep, self.pending = self.pending.partition('\n')
+                line = _gui_ansi_strip(line).rstrip('\r')
+                if line.strip():
+                    self.logs.append('{} │ {}'.format(
+                        time.strftime('%H:%M:%S'), line))
+                    lines.append(line)
+            if len(self.logs) > 1200:
+                del self.logs[:len(self.logs) - 1200]
+            self.version += 1
+        if lines:
+            self.publish({'kind': 'log', 'lines': lines})
+
+    def event(self, text):
+        """A controller-generated note: always one complete line, shown at
+        once (feed_text() above waits for the terminal's newline)."""
+        line = _gui_ansi_strip(str(text or '')).rstrip('\r')
+        if not line.strip():
+            return
+        with self.lock:
+            self.logs.append('{} \u2502 {}'.format(
+                time.strftime('%H:%M:%S'), line))
+            if len(self.logs) > 1200:
+                del self.logs[:len(self.logs) - 1200]
+            self.version += 1
+        self.publish({'kind': 'log', 'lines': [line]})
+
+    def feed_bytes(self, data):
+        # Raw byte writers (sys.stdout.buffer, the shell bridge) land here.
+        try:
+            self.feed_text(bytes(data).decode('utf-8', 'replace'))
+        except Exception:
+            pass
+
+    def tail(self, count=400):
+        with self.lock:
+            return self.logs[-count:]
+
+    # -- browser subscribers (SSE) --------------------------------------------
+    def subscribe(self):
+        box = queue.Queue(maxsize=500)
+        with self.lock:
+            self.subscribers.append(box)
+        return box
+
+    def unsubscribe(self, box):
+        with self.lock:
+            try:
+                self.subscribers.remove(box)
+            except ValueError:
+                pass
+
+    def publish(self, event):
+        with self.lock:
+            subscribers = list(self.subscribers)
+        for box in subscribers:
+            try:
+                box.put_nowait(event)
+            except queue.Full:
+                pass                    # a slow browser still gets /api/state
+
+    # -- GUI downloads --------------------------------------------------------
+    def add_download(self, remote_path, name, op, link):
+        record = {'id': 'g{}'.format(next(self.dl_seq)), 'name': name,
+                  'remote': remote_path, 'op': op, 'link': link,
+                  'status': 'downloading', 'error': '', 'ready_path': '',
+                  'zip_path': '', 'kind': '', 'started': time.time()}
+        with self.lock:
+            self.dl[record['id']] = record
+        return record
+
+    def download_record(self, did):
+        with self.lock:
+            return self.dl.get(did)
+
+    # -- screenshots ------------------------------------------------------------
+    def add_shot(self, path, size):
+        # A monotonic id (not a millisecond timestamp): two shots taken in
+        # the same millisecond are still different pictures for the browser.
+        with self.shot_lock:
+            shot = {'id': 's{}'.format(next(self.shot_seq)), 'path': path,
+                    'size': size, 'ts': time.time()}
+            self.shots.insert(0, shot)
+            del self.shots[12:]
+        return shot
+
+    def last_shot(self):
+        with self.shot_lock:
+            return self.shots[0] if self.shots else None
+
+    def shot_by_id(self, shot_id):
+        with self.shot_lock:
+            for shot in self.shots:
+                if shot['id'] == shot_id:
+                    return shot
+        return None
+
+    # -- snapshot --------------------------------------------------------------
+    def state(self):
+        sessions = []
+        transfers = []
+        screen = {'active': False, 'frames': 0}
+        with SESSIONS_COND:
+            current = CURRENT_LINK[0]
+            links = [(number, SESSIONS[number]) for number in sorted(SESSIONS)
+                     if not SESSIONS[number].dead]
+        for number, link in links:
+            sessions.append({
+                'number': number,
+                'address': _fmt_addr(link.addr),
+                'label': _session_env_label(link),
+                'os': (link.env or {}).get('os') or 'unknown',
+                'jobs': len(link.jobs()),
+                'active': link is current,
+            })
+            for op in link.snapshot():
+                if op.kind not in ('upload', 'download', 'screenshare'):
+                    continue
+                if op.done.is_set() and op.kind != 'download':
+                    continue
+                if op.done.is_set() and op.kind == 'download':
+                    # GUI downloads keep their own records below; a finished
+                    # terminal download has nowhere to go, so drop the row.
+                    if op.transfer_serial is None or not op.background:
+                        continue
+                done = _transfer_done_bytes(op)
+                total = op.transfer_total
+                row = {'serial': op.transfer_serial,
+                       'kind': op.kind,
+                       'name': op.transfer_name or op.label,
+                       'status': ('finished' if op.done.is_set() else
+                                  ('canceling' if op.canceled else
+                                   op.transfer_status or 'running')),
+                       'done': done,
+                       'total': total,
+                       'files': op.transfer_files,
+                       'error': '',
+                       'session': number,
+                       'gui_id': ''}
+                if op.kind == 'download' and op.transfer is not None \
+                        and op.transfer.error:
+                    row['error'] = op.transfer.error
+                if op.kind == 'screenshare':
+                    row['status'] = ('stopping' if op.stopping else 'streaming')
+                    row['done'] = op.frames
+                    row['total'] = None
+                transfers.append(row)
+        with self.lock:
+            gui_downloads = list(self.dl.values())
+        for record in gui_downloads:
+            op = record.get('op')
+            if op is not None:
+                record['done'] = _transfer_done_bytes(op)
+                record['total'] = op.transfer_total
+                record['files'] = op.transfer_files
+                if op.transfer is not None and op.transfer.error \
+                        and record['status'] != 'error':
+                    record['status'] = 'error'
+                    record['error'] = op.transfer.error
+            transfers.append({
+                'serial': None,
+                'kind': 'download',
+                'name': record['name'],
+                'status': record['status'],
+                'done': record.get('done', 0),
+                'total': record.get('total'),
+                'files': record.get('files'),
+                'error': record.get('error', ''),
+                'session': (record['link'].number
+                            if record.get('link') is not None else None),
+                'gui_id': record['id'],
+            })
+        share_op = self.screen_op
+        if share_op is not None and not share_op.done.is_set():
+            screen = {'active': True, 'frames': share_op.frames}
+        else:
+            for _number, link in links:
+                found = False
+                for op in link.snapshot():
+                    if (op.kind == 'screenshare' and not op.done.is_set()
+                            and not op.stopping and op.viewer is not None):
+                        screen = {'active': True, 'frames': op.frames}
+                        found = True
+                        break
+                if found:
+                    break
+        last = self.last_shot()
+        queued = len(QUEUED_COMMANDS) + len(GUI_PENDING_COMMANDS)
+        return {'port': PORT,
+                'uptime_s': int(time.time() - self.started_at),
+                'terminal_shell_active': bool(SHELL_ACTIVE),
+                'queued_commands': queued,
+                'sessions': sessions,
+                'transfers': transfers,
+                'screen': screen,
+                'last_shot': last,
+                'shell': self.shell.snapshot()}
+
+
+class _GuiTeeBuffer(object):
+    """sys.stdout.buffer proxy: bytes still reach the terminal, and a decoded
+copy feeds the dashboard (this is what _shell_stdout() writes through)."""
+
+    def __init__(self, stream, dashboard):
+        self._stream = stream
+        self._dashboard = dashboard
+
+    def write(self, data):
+        try:
+            self._dashboard.feed_bytes(data)
+        except Exception:
+            pass
+        return self._stream.buffer.write(data)
+
+    def flush(self):
+        try:
+            return self._stream.buffer.flush()
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream.buffer, name)
+
+
+class _GuiTee(object):
+    """sys.stdout wrapper: terminal output is copied into the dashboard log."""
+
+    def __init__(self, stream, dashboard):
+        self._stream = stream
+        self._dashboard = dashboard
+        self.buffer = _GuiTeeBuffer(stream, dashboard)
+
+    def write(self, text):
+        try:
+            self._dashboard.feed_text(text)
+        except Exception:
+            pass
+        return self._stream.write(text)
+
+    def flush(self):
+        try:
+            return self._stream.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        try:
+            return self._stream.isatty()
+        except Exception:
+            return False
+
+    def fileno(self):
+        return self._stream.fileno()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def gui_submit_command(line):
+    """Queue a dashboard command for the GUI dispatcher.
+
+The browser console echoes the line itself (it IS the prompt there), so no
+extra '[gui] controller> ...' copy is pushed into the log any more.  The
+dispatcher thread below runs the command even while the terminal prompt
+sits blocked in input() - that was the bug where pressing Enter in the
+browser did nothing until the terminal user typed something."""
+    line = str(line or '').strip()
+    if not line:
+        return
+    with GUI_CMD_COND:
+        GUI_PENDING_COMMANDS.append(line)
+        GUI_CMD_COND.notify()
+
+
+def _gui_request_leave():
+    """'exit' typed in the browser console: leave the controller.
+
+The clean path is the very SIGINT Ctrl+C would send: it must reach the
+prompt thread (the one that may be blocked in input()), so pthread_kill
+aims at that thread specifically - raise_signal() would only signal the
+calling thread and the flag would sit unseen.  Clients keep running and
+reconnect, exactly like Ctrl+C in the terminal."""
+    _gui_note('[+] GUI exit requested - leaving the controller (every client '
+              'keeps running and reconnects).')
+    if os.name == 'posix':
+        try:
+            signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
+            return
+        except (AttributeError, OSError, ValueError):
+            pass
+        try:
+            os.kill(os.getpid(), signal.SIGINT)
+            return
+        except (AttributeError, OSError, ValueError):
+            pass
+    _gui_note('[!] This platform needs the terminal: press Ctrl+C there (or '
+              'close it) to leave.')
+
+
+def _gui_run_client_command(link, line):
+    """A plain shell command from the browser: run it as a background op.
+
+Output is printed by the reader thread when it arrives (exactly like a
+command the terminal moved to the background with Ctrl+B), so the browser
+console never blocks - the next command can be typed right away.  The op
+shows up in 'jobs' and can be stopped from the GUI like any job."""
+    label = line if len(line) <= 60 else line[:57] + '...'
+    op = Op('cmd', next_request_id(), label=label)
+    op.background = True
+    op.gui = True                     # answers print without the [background] tag
+    try:
+        link.add(op)
+        link.send({'type': 'cmd', 'data': line, 'id': op.id})
+    except OSError:
+        link.drop(op)
+        link.mark_lost()
+        _gui_note('[!] The session connection is gone.')
+        return
+
+    def watcher():
+        deadline = time.time() + 24 * 3600.0
+        while not op.done.is_set() and not link.dead:
+            if time.time() > deadline:
+                try:
+                    op.cancel('GUI timeout')
+                except Exception:
+                    pass
+                break
+            time.sleep(0.2)
+        try:
+            link.drop(op)
+        except Exception:
+            pass
+
+    threading.Thread(target=watcher, name='gui-cmd', daemon=True).start()
+
+
+def _gui_cancel_command(link, argument):
+    """The browser version of 'cancel': no y/N prompt (the browser has the
+stop buttons for that), everything else identical."""
+    rows = _active_transfers(link)
+    if not rows:
+        print("[+] Nothing is uploading or downloading right now.")
+        return
+    _print_transfer_menu(link)
+    argument = (argument or '').strip()
+    if not argument:
+        print("[+] GUI: cancel <number> [<number> ...] or 'cancel all' stops "
+              "them right away (no prompt here);")
+        print("    the [x] button on a transfer row does the same.")
+        return
+    choices = _parse_cancel_choices(argument,
+                                    [row.transfer_serial for row in rows])
+    if not choices:
+        print("[!] Use the numbers shown above, 'all', or ranges like 2-4.")
+        return
+    chosen = [row for row in rows if row.transfer_serial in choices]
+    link.pause_transfer_senders()
+    try:
+        for op in chosen:
+            print("[+] Canceling: {}".format(_transfer_row_text(op)))
+            op.cancel('GUI cancel')
+    finally:
+        link.resume_transfer_senders()
+
+
+def _gui_dispatch_line(link, line):
+    """Run one browser-console command on the active session.
+
+A few commands get a browser-native version first ('shell' opens the
+browser PTY instead of stealing the controller's terminal, 'screenshare'
+opens the live tab, ...); everything else goes through the very same
+dispatch table the terminal prompt uses."""
+    parts = line.split()
+    head = parts[0] if parts else ''
+    if line in ('exit', 'quit'):
+        _gui_request_leave()
+        return 'leave'
+    if head == 'shell' and len(parts) == 1:
+        started, message = gui_shell_start(34, 120)
+        if started:
+            _gui_note('[+] GUI shell: {} - switch to the Shell tab and type.'
+                      .format(message))
+        else:
+            _gui_note('[!] GUI shell: {}'.format(message))
+        return 'keep'
+    if head == 'screenshare':
+        fps = None
+        if len(parts) > 1:
+            try:
+                fps = int(parts[1])
+            except ValueError:
+                fps = None
+        result = gui_screen_start(fps)
+        if result.get('ok'):
+            if GUI_STATE is not None:
+                GUI_STATE.publish({'kind': 'open_screen'})
+        else:
+            _gui_note('[!] GUI screenshare: {}'.format(result.get('error')))
+        return 'keep'
+    if head == 'screenshot' and len(parts) == 1:
+        result = gui_screenshot_start()
+        if not result.get('ok'):
+            _gui_note('[!] GUI screenshot: {}'.format(result.get('error')))
+        return 'keep'
+    if head == 'cancel':
+        _gui_cancel_command(link, ' '.join(parts[1:]))
+        return 'keep'
+    if head in ('upex',):
+        # 'upex' with no argument prints the usage; a real upex needs a local
+        # file, so it goes through the shared dispatcher (quiet waits).
+        return _serve_one_command(link, line)
+    # Plain commands (whoami, ls, cd, ping, ...) run as background ops so the
+    # console stays free; special commands (session, jobs, stop, download,
+    # upload, upex <file>, exit session, persist, show options) go through
+    # the shared dispatcher exactly as if typed at the terminal prompt.
+    specials = ('session', 'connect', 'jobs', 'ps', 'stop', 'download',
+                'downloaddir', 'download-dir', 'downloadfolder',
+                'download-folder', 'upload', 'uploaddir', 'upload-dir',
+                'uploadfolder', 'upload-folder', 'upex', 'persist',
+                'unpersist', 'screenshot', 'screenshare', 'shell', 'cancel',
+                'exit', 'quit', 'show')
+    if head in specials or line.rstrip().endswith('&'):
+        return _serve_one_command(link, line)
+    _gui_run_client_command(link, line)
+    return 'keep'
+
+
+def _gui_command_dispatcher():
+    """The browser console's prompt thread.
+
+Browser commands used to sit in a queue until the terminal user pressed
+Enter - now this thread runs them the moment they arrive.  It shares
+DISPATCH_LOCK with the terminal prompt, so a terminal command and a browser
+command never interleave; while the terminal runs one, the browser simply
+waits its turn (and vice versa)."""
+    while True:
+        with GUI_CMD_COND:
+            while not GUI_PENDING_COMMANDS:
+                GUI_CMD_COND.wait(0.5)
+            line = GUI_PENDING_COMMANDS.pop(0)
+        try:
+            link = _active_link()
+            if link is None or link.dead:
+                # No session yet: same handling the waiting prompt does.
+                text = line.strip()
+                if text in ('exit', 'quit'):
+                    _gui_request_leave()
+                    continue
+                if _handle_local_command(text):
+                    continue
+                if text:
+                    _gui_requeue_for_client(text)
+                continue
+            with DISPATCH_LOCK:
+                outcome = _gui_dispatch_line(link, line)
+            if outcome == 'leave':
+                continue            # _gui_request_leave() already acted
+        except Exception as exc:    # a GUI command must never kill the thread
+            try:
+                _gui_note('[!] GUI command failed: {}'.format(exc))
+            except Exception:
+                pass
+
+
+def _gui_requeue_for_client(text):
+    """A browser command typed before any client connected: keep it for the
+prompt, exactly like a command typed into the waiting terminal."""
+    with GUI_CMD_LOCK:
+        QUEUED_COMMANDS.append(text)
+    try:
+        with SESSIONS_COND:
+            SESSIONS_COND.notify_all()
+    except Exception:
+        pass
+
+
+def _drain_gui_commands():
+    """Browser-submitted commands waiting for the prompt (when the GUI is
+    off this is always [], so the hot paths stay untouched)."""
+    if not GUI_PENDING_COMMANDS:
+        return []
+    with GUI_CMD_LOCK:
+        pending = GUI_PENDING_COMMANDS[:]
+        del GUI_PENDING_COMMANDS[:]
+    return pending
+
+
+def _gui_note(text):
+    """A background note for both views: on the terminal it behaves like
+    every other async note (queued while an interactive shell owns the
+    screen), and in the browser it always shows immediately."""
+    if SHELL_ACTIVE and GUI_STATE is not None:
+        GUI_STATE.event(text)   # the terminal is a raw remote shell now
+    _async_print(text)
+
+
+def _gui_shell_worker(link, gui_shell, rows, cols):
+    """Run one browser-driven remote shell in the background.
+
+    Same handshake as start_interactive_shell(): an authenticated second
+    connection the client opens back to us.  Output goes to the dashboard
+    instead of this terminal.  Channels that carry somebody else's token are
+    put back, so a terminal 'shell' started at the same moment still works."""
+    token = secrets.token_urlsafe(24)
+    op = None
+    try:
+        op = link.add(Op('simple', next_request_id(), label='browser shell'))
+        try:
+            link.send({'type': 'shell', 'id': op.id, 'token': token,
+                       'version': 2})
+        except OSError:
+            link.mark_lost()
+            _gui_note('[!] Browser shell: the session connection is gone.')
+            return
+        conn = None
+        addr = None
+        deadline = time.time() + SHELL_ACCEPT_TIMEOUT
+        while conn is None:
+            if link.dead or op.done.is_set():
+                break
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            try:
+                candidate, candidate_addr, candidate_token = SHELL_CHANNELS.get(
+                    timeout=min(0.2, remaining))
+            except (queue.Empty, ValueError):
+                continue
+            if not candidate_token or not secrets.compare_digest(
+                    str(candidate_token), token):
+                try:
+                    SHELL_CHANNELS.put_nowait(
+                        (candidate, candidate_addr, candidate_token))
+                except queue.Full:
+                    try:
+                        candidate.close()
+                    except OSError:
+                        pass
+                time.sleep(0.05)
+                continue
+            conn, addr = candidate, candidate_addr
+        if conn is None:
+            if op.done.is_set():
+                _gui_note('[!] Browser shell: the client refused the shell '
+                          '(its message is printed above).')
+            else:
+                _gui_note('[!] Browser shell: the client did not open the shell '
+                          'channel in time. A tunnel may have dropped the '
+                          'second connection.')
+            return
+        try:
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        client_os = ((link.env or {}).get('os') or '').lower()
+        try:
+            rows = int(rows or 0)
+        except (TypeError, ValueError):
+            rows = 0
+        try:
+            cols = int(cols or 0)
+        except (TypeError, ValueError):
+            cols = 0
+        gui_shell.attach(conn, client_os)
+        _gui_note('[+] Browser shell connected to session {} ({}) - type in '
+                  'the shell panel.'.format(link.number, client_os or 'unknown OS'))
+        try:
+            conn.sendall(struct.pack('!HH', max(1, rows or 24),
+                                     max(1, cols or 110)))
+        except OSError:
+            gui_shell.detach()
+            return
+        try:
+            while True:
+                readable, _w, _x = select.select([conn], [], [], 0.25)
+                if conn in readable:
+                    data = conn.recv(RECV_CHUNK)
+                    if not data:
+                        break
+                    gui_shell.write_out(data)
+        except (OSError, ValueError):
+            pass
+        finally:
+            gui_shell.detach()
+            try:
+                conn.close()
+            except OSError:
+                pass
+            _gui_note('[+] Browser shell ended.')
+    finally:
+        if op is not None:
+            link.drop(op)               # the shell session is its own channel
+
+
+def gui_shell_start(rows=None, cols=None):
+    """Start a browser-driven remote shell on the active session."""
+    if GUI_STATE is None:
+        return False, 'the GUI is not running'
+    link = _active_link()
+    if link is None or link.dead:
+        return False, 'no connected session'
+    if GUI_STATE.shell.conn is not None:
+        return False, 'a browser shell is already running'
+    threading.Thread(target=_gui_shell_worker,
+                     args=(link, GUI_STATE.shell, rows, cols),
+                     name='gui-shell', daemon=True).start()
+    return True, 'opening an interactive shell on session {}'.format(link.number)
+
+
+# ---------------------------------------------------------------------------
+# Quiet operations: the GUI's hidden hands.
+#
+# The browser drives the very same requests the terminal does, but nobody
+# wants 'ls' spam printed into the prompt while browsing.  A _QuietOp answers
+# into the GUI instead of the terminal; the wire protocol is untouched.
+# ---------------------------------------------------------------------------
+
+class _QuietOp(Op):
+    """An Op that captures the client's answers without printing them.
+
+    Streaming transfers (downloads) still use every bit of the normal
+    machinery - only the final printout is silenced."""
+
+    def __init__(self, kind, req_id, label=None, save_as=None):
+        Op.__init__(self, kind, req_id, label=label, save_as=save_as)
+        self.result = None        # ('output', text) | ('error', text)
+        # | ('image', bytes) | ('file', bytes, name)
+
+    def handle(self, msg):
+        mtype = msg.get('type')
+        if mtype == 'frame':
+            return self._frame(msg)
+        if not self._is_mine(msg):
+            return False
+        if mtype in ('transfer_progress', 'transfer_begin', 'transfer_entries',
+                     'transfer_file_begin', 'transfer_chunk',
+                     'transfer_file_end', 'transfer_abort', 'transfer_end'):
+            return self._handle_transfer(msg)
+        if mtype == 'output':
+            data = msg.get('data', '')
+            if not isinstance(data, str):
+                data = str(data)
+            self.result = ('output', data)
+            self.succeeded = True
+            self.done.set()
+            return True
+        if mtype == 'error':
+            try:
+                text = _capture_text(print_client_error, msg)
+            except Exception:
+                text = json.dumps(msg, default=str)
+            self.result = ('error', text)
+            self.succeeded = False
+            self.done.set()
+            return True
+        if mtype == 'image' and self.kind == 'screenshot':
+            try:
+                data = base64.b64decode(msg.get('data', '') or '')
+            except Exception:
+                data = b''
+            self.result = ('image', data)
+            self.succeeded = bool(data)
+            self.done.set()
+            return True
+        if mtype == 'file' and self.kind == 'download':
+            try:
+                data = base64.b64decode(msg.get('data', '') or '')
+                name = os.path.basename(str(msg.get('name') or '')
+                                        .replace('\\', '/')) or 'downloaded.bin'
+            except Exception:
+                data, name = b'', 'downloaded.bin'
+            self.result = ('file', data, name)
+            self.succeeded = bool(data)
+            self.done.set()
+            return True
+        return False
+
+
+def _gui_run_quiet(link, request, timeout, kind='cmd', label=None):
+    """Send one request and collect its answer quietly.  Returns the op."""
+    op = _QuietOp(kind, next_request_id(), label=label or 'gui ' + kind)
+    op.background = True
+    try:
+        link.add(op)
+        payload = dict(request)
+        payload['id'] = op.id
+        link.send(payload)
+    except OSError:
+        link.mark_lost()
+        op.result = ('error', 'the session connection is gone')
+        op.done.set()
+        return op
+    deadline = time.time() + timeout
+    while not op.done.is_set():
+        if link.dead:
+            if op.result is None:
+                op.result = ('error', 'the session disconnected')
+            op.done.set()
+            break
+        if time.time() > deadline:
+            if op.result is None:
+                op.result = ('error', 'timed out waiting for the client')
+            try:
+                op.cancel('GUI timeout')
+            except Exception:
+                pass
+            break
+        time.sleep(0.08)
+    return op
+
+
+def _gui_active_link():
+    """(link, None) for a usable session, else (None, reason)."""
+    link = _active_link()
+    if link is None:
+        return None, 'no connected session - start a client first'
+    if link.dead:
+        return None, 'the active session just disconnected'
+    return link, None
+
+
+def _gui_sh_quote(text):
+    """POSIX shell quoting for one argument."""
+    import re
+    text = str(text)
+    if not text:
+        return "''"
+    if not re.search(r"[^A-Za-z0-9_@%+=:,./-]", text):
+        return text
+    return "'" + text.replace("'", "'\"'\"'") + "'"
+
+
+def _gui_win_quote(text):
+    """cmd.exe double-quote wrapping for one argument."""
+    import re
+    text = str(text)
+    if re.search(r"[\s&()^%!=;,]", text):
+        return '"' + text.replace('"', '') + '"'
+    return text
+
+
+def _gui_client_os(link):
+    return ((link.env or {}).get('os') or '').lower()
+
+
+# Directory listing runs as a hidden command on the client.  The client runs
+# Python by definition (that is what client.py is), so a tiny interpreter
+# one-liner returns JSON - one structured answer works on Windows, macOS,
+# Linux and iOS alike, including hidden entries.  The POSIX script keeps to
+# double quotes (it is wrapped in single quotes) and the Windows script keeps
+# to single quotes (it is wrapped in double quotes), so no escaping fights.
+
+_GUI_LISTER_POSIX = """import os,sys,json
+d=os.path.expanduser(sys.argv[1])
+try:
+    p=os.path.abspath(d)
+except Exception:
+    p=d
+out=[]
+if os.path.isdir(d):
+    for n in sorted(os.listdir(d)):
+        f=os.path.join(d,n)
+        try:
+            st=os.stat(f)
+            out.append({"n":n,"k":("dir" if os.path.isdir(f) else "file"),"s":st.st_size,"m":int(st.st_mtime)})
+        except OSError:
+            out.append({"n":n,"k":"file","s":-1,"m":0})
+else:
+    out=None
+print("CMONLIST:"+json.dumps({"path":p,"entries":out}))"""
+
+_GUI_LISTER_WINDOWS = (
+    "import os,sys,json;d=os.path.expanduser(sys.argv[1]);"
+    "p=os.path.abspath(d);"
+    "out=[{'n':n,'k':('dir' if os.path.isdir(f) else 'file'),"
+    "'s':(os.stat(f).st_size if os.path.exists(f) else 0),"
+    "'m':(int(os.stat(f).st_mtime) if os.path.exists(f) else 0)} "
+    "for n in (os.listdir(d) if os.path.isdir(d) else []) "
+    "for f in [os.path.join(d,n)]]; "
+    "print('CMONLIST:'+json.dumps({'path':p,'entries':out}))")
+
+_GUI_PY_CANDIDATES = {'windows': ('python', 'py', 'python3'),
+                      'posix': ('python3', 'python')}
+_GUI_INTERP_OK = {}               # session number -> interpreter that works
+
+
+def _gui_parse_listing(op):
+    """Pull the CMONLIST payload out of a quiet listing run. None = no data."""
+    if op is None or not op.result or op.result[0] != 'output':
+        return None
+    text = op.result[1]
+    marker = text.rfind('CMONLIST:')
+    if marker < 0:
+        return None
+    try:
+        data = json.loads(text[marker + len('CMONLIST:'):].strip())
+    except ValueError:
+        return None
+    entries = data.get('entries')
+    if not isinstance(entries, list):
+        return None
+    path = str(data.get('path') or '')
+    rows = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get('n') or '')
+        if not name or name in ('.', '..'):
+            continue
+        rows.append({'n': name,
+                     'k': 'dir' if entry.get('k') == 'dir' else 'file',
+                     's': entry.get('s') if isinstance(entry.get('s'),
+                                                       int) else 0,
+                     'm': entry.get('m') if isinstance(entry.get('m'),
+                                                       int) else 0,
+                     'h': name.startswith('.')})
+    rows.sort(key=lambda row: (row['k'] != 'dir', row['n'].lower()))
+    up = os.path.dirname(path.rstrip('\\/')) if path.rstrip('\\/') else None
+    if up == path:
+        up = None
+    return {'ok': True, 'path': path, 'up': up, 'entries': rows}
+
+
+def gui_files_list(path):
+    """One hidden listing command on the active session -> JSON rows."""
+    if GUI_STATE is None:
+        return {'ok': False, 'error': 'the GUI is not running'}
+    link, error = _gui_active_link()
+    if link is None:
+        return {'ok': False, 'error': error}
+    path = str(path or '~').strip() or '~'
+    client_os = _gui_client_os(link)
+    if 'win' in client_os:
+        candidates = list(_GUI_PY_CANDIDATES['windows'])
+        windows = True
+    else:
+        candidates = list(_GUI_PY_CANDIDATES['posix'])
+        windows = False
+    remembered = _GUI_INTERP_OK.get(link.number)
+    if remembered in candidates:
+        candidates.remove(remembered)
+        candidates.insert(0, remembered)
+    last_op = None
+    for interp in candidates:
+        if windows:
+            quoted = interp if ' ' not in interp else '"{}"'.format(interp)
+            command = '{} -c "{}" {}'.format(quoted, _GUI_LISTER_WINDOWS,
+                                             _gui_win_quote(path))
+        else:
+            command = "{} -c '{}' {} ".format(interp, _GUI_LISTER_POSIX,
+                                              _gui_sh_quote(path))
+        last_op = _gui_run_quiet(link, {'type': 'cmd', 'data': command},
+                                 timeout=30, kind='cmd',
+                                 label='gui file list')
+        result = _gui_parse_listing(last_op)
+        if result is not None:
+            _GUI_INTERP_OK[link.number] = interp
+            result['sep'] = '\\' if windows else '/'
+            return result
+        if link.dead:
+            break
+    if last_op is not None and last_op.result \
+            and last_op.result[0] == 'error':
+        return {'ok': False,
+                'error': last_op.result[1].strip() or 'the listing failed'}
+    return {'ok': False,
+            'error': 'could not list the folder: no usable Python '
+                     'interpreter answered on the client'}
+
+
+# ---------------------------------------------------------------------------
+# GUI feature workers: download-to-browser, upload, upload+execute, screenshot
+# and the screen share.  Each one presses the same buttons the terminal does,
+# only quietly and from a worker thread so the prompt never blocks.
+# ---------------------------------------------------------------------------
+
+def _gui_basename(remote_path):
+    name = str(remote_path or '').replace('\\', '/').rstrip('/').rpartition('/')[2]
+    name = name.strip()
+    if not name or name in ('.', '..'):
+        name = 'download'
+    return name[:150]
+
+
+def gui_download_start(remote_path):
+    """Download a client file/folder with the normal streamed transfer into
+    the GUI scratch folder; the browser fetches it via /api/files/item."""
+    if GUI_STATE is None:
+        return {'ok': False, 'error': 'the GUI is not running'}
+    link, error = _gui_active_link()
+    if link is None:
+        return {'ok': False, 'error': error}
+    remote_path = str(remote_path or '').strip()
+    if not remote_path:
+        return {'ok': False, 'error': 'no path given'}
+    name = _gui_basename(remote_path)
+    target = os.path.join(GUI_STATE.tmp_dir(), 'dl_{}_{}'.format(
+        int(time.time() * 1000 % 100000000000), name))
+    op = _QuietOp('download', next_request_id(),
+                  label='GUI download {}'.format(name), save_as=target)
+    op.transfer_serial = next(TRANSFER_SERIAL)
+    op.transfer_name = name
+    op.transfer_status = 'scanning'
+    op.background = True
+    request = {'type': 'download', 'path': remote_path,
+               'recursive': True, 'stream': True}
+    try:
+        link.add(op)
+        link.send(dict(request, id=op.id))
+    except OSError:
+        link.drop(op)
+        link.mark_lost()
+        return {'ok': False, 'error': 'the session connection is gone'}
+    record = GUI_STATE.add_download(remote_path, name, op, link)
+    _gui_note('[+] GUI download started: {}'.format(remote_path))
+
+    def worker():
+        # TransferOpState._finish() completes the op and clears op.transfer
+        # by design (that is how the terminal learns the result), and for a
+        # small file that happens before this worker's first poll.  The
+        # destination was chosen here (save_as), so simply wait for the op
+        # and then look at what arrived on disk.
+        deadline = time.time() + 24 * 3600.0
+        while not op.done.is_set() and not link.dead:
+            if time.time() > deadline:
+                try:
+                    op.cancel('GUI timeout')
+                except Exception:
+                    pass
+                break
+            time.sleep(0.25)
+        if link.dead and not op.done.is_set():
+            record['status'] = 'error'
+            record['error'] = 'the session disconnected'
+        legacy = op.result if (op.result and op.result[0] == 'file') else None
+        if record['status'] != 'error' and legacy is not None:
+            # An older client answered with one single base64 'file' message
+            # instead of the streamed transfer: save that.
+            record['kind'] = 'file'
+            legacy_path = target + '.bin'
+            try:
+                with open(legacy_path, 'wb') as f:
+                    f.write(legacy[1])
+                record['ready_path'] = legacy_path
+            except OSError as exc:
+                record['status'] = 'error'
+                record['error'] = 'could not save the file: {}'.format(exc)
+        if record['status'] != 'error' and not record['ready_path']:
+            if os.path.isdir(target):
+                record['kind'] = 'dir'
+                record['ready_path'] = target
+            elif os.path.isfile(target):
+                record['kind'] = 'file'
+                record['ready_path'] = target
+        if record['status'] != 'error' and not record['ready_path']:
+            record['status'] = 'error'
+            if not record['error']:
+                record['error'] = 'the client sent no transfer data'
+        if record['status'] != 'error' and record['kind'] == 'dir':
+            base = record['ready_path']
+            if not base or not os.path.isdir(base):
+                record['status'] = 'error'
+                record['error'] = 'the folder did not arrive'
+            else:
+                record['status'] = 'packing'
+                zip_path = base + '.zip'
+                try:
+                    import zipfile
+                    with zipfile.ZipFile(zip_path, 'w',
+                                         zipfile.ZIP_DEFLATED) as archive:
+                        for root, _dirs, files in os.walk(base):
+                            for fname in files:
+                                full = os.path.join(root, fname)
+                                arc = os.path.relpath(full, base)
+                                try:
+                                    archive.write(full, arc)
+                                except OSError:
+                                    pass
+                    record['zip_path'] = zip_path
+                    record['status'] = 'ready'
+                except Exception as exc:
+                    record['status'] = 'error'
+                    record['error'] = 'could not pack the folder: {}'.format(exc)
+        elif record['status'] != 'error':
+            ready = record['ready_path']
+            if ready and os.path.isfile(ready):
+                record['status'] = 'ready'
+            else:
+                record['status'] = 'error'
+                if not record['error']:
+                    record['error'] = 'the file did not arrive'
+        record['finished'] = time.time()
+        if record['status'] == 'ready':
+            _gui_note('[+] GUI download ready: {} ({} bytes)'.format(
+                record['name'], os.path.getsize(
+                    record['zip_path'] or record['ready_path'] or 0)))
+        else:
+            _gui_note('[!] GUI download failed: {} ({})'.format(
+                record['name'], record['error']))
+        try:
+            link.drop(op)
+        except Exception:
+            pass
+
+    threading.Thread(target=worker, name='gui-download',
+                     daemon=True).start()
+    return {'ok': True, 'id': record['id'], 'name': name}
+
+
+def _gui_parse_multipart(content_type, body):
+    """Parse one multipart/form-data body -> [(field, filename, bytes), ...].
+
+    The field name matters for upex: the browser posts the app under 'file'
+    and the picked auto launcher under 'auto'."""
+    import email.parser
+    try:
+        message = email.parser.BytesParser().parsebytes(
+            b'Content-Type: ' + content_type.encode('utf-8', 'replace') +
+            b'\r\n\r\n' + body)
+    except Exception:
+        return []
+    if not message.is_multipart():
+        return []
+    parts = []
+    for part in message.get_payload():
+        if not isinstance(part, email.message.Message):
+            continue
+        filename = part.get_filename() or 'file.bin'
+        field = part.get_param('name', header='content-disposition')
+        if not isinstance(field, str) or not field:
+            field = 'file'
+        data = part.get_payload(decode=True)
+        if data is None:
+            continue
+        parts.append((field, filename, data))
+    return parts
+
+
+_GUI_UPLOAD_LIMIT = 1024 * 1024 * 1024      # 1 GiB per browser upload
+
+
+def _gui_upload_file_quiet(link, local, label, remote_name=None):
+    """Upload one local file through the normal pipeline and wait quietly.
+
+Returns the sanitized remote name, or None when the upload failed."""
+    name = os.path.basename(local)
+    op = Op('upload', next_request_id(), label=label or 'GUI upload')
+    op.transfer_serial = next(TRANSFER_SERIAL)
+    op.transfer_name = remote_name or name
+    op.transfer_kind = 'file'
+    op.transfer_status = 'scanning'
+    op.background = True
+    link.add(op)
+    threading.Thread(target=_upload_transfer,
+                     args=(link, op, local, remote_name),
+                     name='gui-upload', daemon=True).start()
+    deadline = time.time() + 24 * 3600.0
+    while not op.done.is_set() and not link.dead:
+        if time.time() > deadline:
+            break
+        time.sleep(0.25)
+    if link.dead or not op.succeeded:
+        try:
+            link.drop(op)
+        except Exception:
+            pass
+        return None
+    remote_name = op.transfer_name or name
+    try:
+        link.drop(op)
+    except Exception:
+        pass
+    return remote_name
+
+
+def _gui_upex_autos():
+    """The auto launchers available next to this controller: auto.py,
+auto.cs, auto.js and auto.sh from the auto/ folder or the controller's own
+folder (exactly where the terminal 'upex auto.<type> ...' reads them)."""
+    found = []
+    seen = set()
+    for folder in (os.path.join(os.getcwd(), 'auto'), os.getcwd()):
+        try:
+            entries = sorted(os.listdir(folder))
+        except OSError:
+            continue
+        for entry in entries:
+            base = entry.lower()
+            if not base.startswith('auto.'):
+                continue
+            ext = base.rpartition('.')[2]
+            if ext in UPEX_AUTO_TYPES and entry not in seen:
+                seen.add(entry)
+                try:
+                    size = os.path.getsize(os.path.join(folder, entry))
+                except OSError:
+                    size = 0
+                found.append({'name': entry, 'type': ext, 'size': size})
+    found.sort(key=lambda item: item['name'])
+    return found
+
+
+def _gui_upex_report(result, link):
+    """Show one upex result in both views (the worker's tail)."""
+    if result and result[0] == 'output':
+        text = result[1] or ''
+        if len(text) > 4000:
+            head = text[:2000]
+            saved_path = os.path.join(
+                GUI_STATE.tmp_dir(), 'upex_output_{}.txt'.format(
+                    time.strftime('%H%M%S')))
+            try:
+                with open(saved_path, 'w', encoding='utf-8',
+                          errors='backslashreplace') as f:
+                    f.write(text)
+            except OSError:
+                saved_path = ''
+            tail = text[-1200:]
+            _gui_note('[+] GUI upex finished: {} bytes of output{}.'
+                      .format(len(text),
+                              ' (full output saved to {})'.format(
+                                  saved_path) if saved_path else ''))
+            _gui_note('[upex head]\n' + head)
+            _gui_note('[upex tail]\n' + tail)
+        else:
+            _gui_note('[+] GUI upex output:\n' + (text or '[no output]'))
+    elif result and result[0] == 'error':
+        _gui_note('[!] GUI upex failed on the client: {}'.format(
+            result[1].strip()))
+    else:
+        _gui_note('[!] GUI upex: no result from the client ({}).'
+                  .format('disconnected' if link.dead else 'timeout'))
+
+
+def gui_upload_start(filename, data, mode='upload', auto_name=None,
+                     hidden=False, auto_file=None):
+    """Save a browser file and run the normal upload pipeline.
+
+mode='upload' is a plain upload; mode='upex' is Upload & Execute with the
+same features the terminal has.  The auto launcher comes either from a file
+picked in the browser (auto_file = (name, bytes); any .py/.cs/.js/.sh file
+works, exactly like 'upex auto.<type> <app>') or, for compatibility, from
+the controller's auto/ folder by name (auto_name).  Hidden mode follows the
+terminal rule: it only exists together with an auto launcher, because
+'upex -h' is only defined for 'upex -h auto.<type> <app>'."""
+    if GUI_STATE is None:
+        return {'ok': False, 'error': 'the GUI is not running'}
+    link, error = _gui_active_link()
+    if link is None:
+        return {'ok': False, 'error': error}
+    name = str(filename or 'upload.bin').replace('\\', '/').rpartition('/')[2]
+    name = name.strip() or 'upload.bin'
+    if len(name) > 150:
+        name = name[-150:]
+    local = os.path.join(GUI_STATE.tmp_dir(), 'up_{}_{}'.format(
+        int(time.time() * 1000 % 100000000000), name))
+    try:
+        with open(local, 'wb') as f:
+            f.write(data)
+    except OSError as exc:
+        return {'ok': False, 'error': 'could not buffer the upload: {}'.format(exc)}
+    if mode == 'upex':
+        app_type = _upex_type_from_name(name)
+        if not app_type:
+            return {'ok': False, 'error':
+                    'upex does not know how to run .{} files (supported: {})'
+                    .format(os.path.splitext(name)[1] or '?',
+                            ', '.join(sorted(UPEX_EXTENSIONS)))}
+        os_name = _upex_os_name(link)
+        auto_path = None
+        auto_type = None
+        auto_send_name = None          # the clean name the client receives
+        if auto_file is not None:
+            # A launcher picked from the browser's local-folder dialog.
+            auto_filename, auto_data = auto_file
+            auto_base = str(auto_filename or '').replace('\\', '/')
+            auto_base = auto_base.rpartition('/')[2].strip()
+            auto_type = _upex_type_from_name(auto_base)
+            if auto_type not in UPEX_AUTO_TYPES:
+                return {'ok': False, 'error':
+                        'the auto launcher must be a .py, .cs, .js or .sh '
+                        'file (like auto.sh or auto.py)'}
+            if auto_base == name:
+                return {'ok': False, 'error':
+                        'the app and the auto launcher cannot have the same name'}
+            auto_path = os.path.join(GUI_STATE.tmp_dir(), 'auto_{}_{}'.format(
+                int(time.time() * 1000 % 100000000000), auto_base))
+            try:
+                with open(auto_path, 'wb') as f:
+                    f.write(auto_data)
+            except OSError as exc:
+                return {'ok': False, 'error':
+                        'could not buffer the auto launcher: {}'.format(exc)}
+            # The client sees the picked file's own name (auto.sh), not the
+            # scratch name it is buffered under on this side.
+            auto_send_name = auto_base
+        elif auto_name:
+            # Compatibility: a launcher that already lives next to
+            # controller.py (the auto/ folder).
+            auto_type = _upex_type_from_name(str(auto_name))
+            if auto_type not in UPEX_AUTO_TYPES:
+                return {'ok': False, 'error':
+                        'the auto launcher must be auto.py, auto.cs, auto.js '
+                        'or auto.sh'}
+            auto_path = _upex_auto_path(str(auto_name))
+            if auto_path is None:
+                return {'ok': False, 'error':
+                        '{} was not found in the controller\'s auto/ folder '
+                        '(or next to controller.py)'.format(auto_name)}
+            if os.path.basename(local) == os.path.basename(auto_path) \
+                    or name == os.path.basename(auto_path):
+                return {'ok': False, 'error':
+                        'the app and the auto launcher cannot have the same name'}
+            auto_send_name = os.path.basename(auto_path)
+        if hidden and auto_path is None:
+            # The same rule the checkbox already enforces in the page: hidden
+            # mode is an auto-launcher feature ('upex -h auto.<type> <app>').
+            return {'ok': False, 'error':
+                    'hidden mode needs an auto launcher (upex -h '
+                    'auto.<type> <app>)'}
+        problem = _upex_validate(app_type, os_name, auto_mode=auto_path is not None)
+        if problem:
+            return {'ok': False, 'error': problem}
+        hidden = bool(hidden and auto_path is not None)
+        # The command a terminal user would type for exactly this upload.
+        equivalent = 'upex'
+        if hidden:
+            equivalent += ' -h'
+        if auto_path is not None:
+            equivalent += ' auto.{}'.format(auto_type)
+        equivalent += ' {}'.format(name)
+
+        def upex_worker():
+            _gui_note('[+] GUI upex: {} - uploading {}...'.format(
+                equivalent, name))
+            app_remote = _gui_upload_file_quiet(
+                link, local, 'GUI upex upload {}'.format(name),
+                remote_name=name)
+            if app_remote is None:
+                _gui_note('[!] GUI upex: the upload of {} failed.'.format(name))
+                return
+            auto_remote = None
+            if auto_path is not None:
+                _gui_note('[+] GUI upex: uploading the launcher {}...'.format(
+                    auto_send_name))
+                auto_remote = _gui_upload_file_quiet(
+                    link, auto_path, 'GUI upex launcher',
+                    remote_name=auto_send_name)
+                if auto_remote is None:
+                    if link.dead:
+                        return
+                    _gui_note('[!] GUI upex: could not upload the launcher; '
+                              'running the app normally.')
+                    auto_remote = None
+                elif app_remote == auto_remote:
+                    _gui_note('[!] GUI upex: the app and the launcher collided; '
+                              'refusing to execute.')
+                    return
+            if auto_remote:
+                _gui_note('[+] GUI upex: running {} {}{} on the client...'
+                          .format(auto_remote, app_remote,
+                                  ' (hidden)' if hidden else ''))
+            else:
+                _gui_note('[+] GUI upex: running {} on the client...'
+                          .format(app_remote))
+            exec_op = _QuietOp('cmd', next_request_id(),
+                               label='GUI upex run {}'.format(app_remote))
+            try:
+                link.add(exec_op)
+                link.send({'type': 'upex', 'app': app_remote,
+                           'app_type': app_type, 'auto': auto_remote,
+                           'auto_type': (auto_type if auto_remote else None),
+                           'hidden': bool(hidden and auto_remote),
+                           'id': exec_op.id})
+            except OSError:
+                link.mark_lost()
+                _gui_note('[!] GUI upex: the session connection is gone.')
+                return
+            deadline = time.time() + 6 * 3600.0
+            while not exec_op.done.is_set() and not link.dead:
+                if time.time() > deadline:
+                    try:
+                        exec_op.cancel('GUI timeout')
+                    except Exception:
+                        pass
+                    break
+                time.sleep(0.4)
+            _gui_upex_report(exec_op.result, link)
+            try:
+                link.drop(exec_op)
+            except Exception:
+                pass
+
+        threading.Thread(target=upex_worker, name='gui-upex',
+                         daemon=True).start()
+        return {'ok': True, 'mode': 'upex', 'command': equivalent,
+                'message': 'upload & execute started ({})'.format(equivalent)}
+    op = Op('upload', next_request_id(), label='upload {}'.format(name))
+    op.transfer_serial = next(TRANSFER_SERIAL)
+    op.transfer_name = name
+    op.transfer_kind = 'file'
+    op.transfer_status = 'scanning'
+    op.background = True
+    link.add(op)
+    threading.Thread(target=_upload_transfer,
+                     args=(link, op, local, name),
+                     name='gui-upload', daemon=True).start()
+    _gui_note('[+] GUI upload started: {} - the client saves it in its '
+              'current directory.'.format(name))
+    return {'ok': True, 'mode': 'upload',
+            'message': 'uploading {}'.format(name)}
+
+
+def gui_upload_folder_start(parts):
+    """Upload a whole local folder chosen in the browser.
+
+The file picker hands us every file with its path relative to the chosen
+folder; the tree is rebuilt in the GUI scratch folder and pushed with one
+normal folder upload, so the client receives a real folder."""
+    if GUI_STATE is None:
+        return {'ok': False, 'error': 'the GUI is not running'}
+    link, error = _gui_active_link()
+    if link is None:
+        return {'ok': False, 'error': error}
+    if not parts:
+        return {'ok': False, 'error': 'no files in the upload'}
+    folder_name = 'uploaded_folder'
+    root = None
+    count = 0
+    base = os.path.join(GUI_STATE.tmp_dir(), 'updir_{}'.format(
+        int(time.time() * 1000 % 100000000000)))
+    for _field, raw_name, data in parts:
+        rel = str(raw_name or '').replace('\\', '/').lstrip('/')
+        rel = rel.strip()
+        if not rel:
+            continue
+        pieces = [piece for piece in rel.split('/') if piece not in ('', '.', '..')]
+        if not pieces:
+            continue
+        if root is None:
+            root = pieces[0]
+            folder_name = pieces[0]
+        elif pieces[0] != root:
+            return {'ok': False,
+                    'error': 'all files must come from one folder'}
+        local = os.path.join(base, *pieces)
+        try:
+            os.makedirs(os.path.dirname(local), exist_ok=True)
+            with open(local, 'wb') as f:
+                f.write(data)
+        except OSError as exc:
+            return {'ok': False,
+                    'error': 'could not buffer the folder: {}'.format(exc)}
+        count += 1
+    if root is None or not count:
+        return {'ok': False, 'error': 'no files in the upload'}
+    op = Op('upload', next_request_id(),
+            label='upload folder {}'.format(folder_name))
+    op.transfer_serial = next(TRANSFER_SERIAL)
+    op.transfer_name = folder_name
+    op.transfer_kind = 'folder'
+    op.transfer_status = 'scanning'
+    op.background = True
+    link.add(op)
+    threading.Thread(target=_upload_transfer,
+                     args=(link, op, base, folder_name),
+                     name='gui-upload-folder', daemon=True).start()
+    _gui_note('[+] GUI upload started: folder {} ({} files) - the client '
+              'receives it as a real folder.'.format(folder_name, count))
+    return {'ok': True, 'mode': 'upload',
+            'message': 'uploading folder {} ({} files)'.format(folder_name,
+                                                               count)}
+
+
+def gui_screenshot_start():
+    """One hidden screenshot request; the image shows up in the browser page.
+
+    Every shot is saved next to controller.py (the controller's own working
+    directory, exactly like the terminal 'screenshot' command), under a fresh
+    name so repeated shots never overwrite each other; the dashboard's Last
+    screenshot card syncs to the newest one."""
+    if GUI_STATE is None:
+        return {'ok': False, 'error': 'the GUI is not running'}
+    link, error = _gui_active_link()
+    if link is None:
+        return {'ok': False, 'error': error}
+    if not GUI_STATE.shot_busy.acquire(blocking=False):
+        return {'ok': False, 'error': 'a screenshot is already being captured - '
+                                      'it finishes in a moment, then try again'}
+
+    def worker():
+        op = None
+        try:
+            path = _next_free_path(os.path.join(
+                os.getcwd(), 'screenshot_{}.jpg'.format(
+                    time.strftime('%Y%m%d_%H%M%S'))))
+            op = _QuietOp('screenshot', next_request_id(),
+                          label='GUI screenshot', save_as=path)
+            try:
+                link.add(op)
+                link.send({'type': 'screenshot', 'id': op.id})
+            except OSError:
+                link.mark_lost()
+                _gui_note('[!] GUI screenshot: the session connection is gone.')
+                return
+            deadline = time.time() + 60.0
+            while not op.done.is_set() and not link.dead:
+                if time.time() > deadline:
+                    try:
+                        op.cancel('GUI timeout')
+                    except Exception:
+                        pass
+                    _gui_note('[!] GUI screenshot timed out - the client did '
+                              'not answer. Another shot can be taken now.')
+                    break
+                time.sleep(0.15)
+            result = op.result
+            if result and result[0] == 'image' and result[1]:
+                try:
+                    with open(path, 'wb') as f:
+                        f.write(result[1])
+                except OSError as exc:
+                    _gui_note('[!] GUI screenshot could not be saved: {}'.format(exc))
+                    return
+                shot = GUI_STATE.add_shot(path, len(result[1]))
+                _gui_note('[+] GUI screenshot saved: {} ({} bytes) - the Last '
+                          'screenshot card now shows it.'.format(
+                              os.path.abspath(path), len(result[1])))
+                GUI_STATE.publish({'kind': 'shot', 'id': shot['id']})
+            elif not (op.canceled or link.dead):
+                why = (result[1].strip() if result and result[0] == 'error'
+                       else 'the client sent no image (a desktop/permission '
+                            'may be missing on the client)')
+                _gui_note('[!] GUI screenshot failed: {}'.format(why))
+        finally:
+            if op is not None:
+                try:
+                    link.drop(op)       # never leak the op into later answers
+                except Exception:
+                    pass
+            GUI_STATE.shot_busy.release()
+
+    threading.Thread(target=worker, name='gui-screenshot',
+                     daemon=True).start()
+    return {'ok': True, 'message': 'capturing a screenshot - it is saved next '
+                                   'to controller.py and shown in the page'}
+
+
+def _gui_active_viewer():
+    """The BrowserViewer of the live screen share (GUI or terminal started)."""
+    if GUI_STATE is not None:
+        op = GUI_STATE.screen_op
+        if (op is not None and not op.done.is_set() and not op.stopping
+                and op.viewer is not None):
+            return op.viewer
+    with SESSIONS_COND:
+        links = list(SESSIONS.values())
+    best = None
+    for link in links:
+        for op in link.snapshot():
+            if (op.kind == 'screenshare' and not op.done.is_set()
+                    and not op.stopping and op.viewer is not None):
+                if best is None or op.stream_start > best.stream_start:
+                    best = op
+    return best.viewer if best is not None else None
+
+
+def gui_screen_start(fps=None):
+    """Start a screen share the same way the terminal 'screenshare' command
+    does; the browser watches /api/screen/stream (usually in its own tab)."""
+    if GUI_STATE is None:
+        return {'ok': False, 'error': 'the GUI is not running'}
+    link, error = _gui_active_link()
+    if link is None:
+        return {'ok': False, 'error': error}
+    if not GUI_STATE.screen_lock.acquire(blocking=False):
+        return {'ok': False, 'error': 'a screen share is already running - '
+                                      'open the Screen tab or stop it first'}
+
+    def worker():
+        op = None
+        try:
+            _retire_screenshares(link)
+            viewer = BrowserViewer()
+            try:
+                viewer.start()
+            except Exception as exc:
+                _gui_note('[!] GUI screen share: could not start the viewer: '
+                          '{}'.format(exc))
+                return
+            op = _QuietOp('screenshare', next_request_id(),
+                          label='GUI screenshare')
+            op.viewer = viewer
+            op.background = True
+            GUI_STATE.screen_op = op
+            request = {'type': 'screenshare'}
+            # fps is parsed defensively: anything that is not a positive
+            # integer simply means "let the client pick its default rate".
+            # (The old code crashed the worker here and the released lock
+            # left the dashboard refusing every later click.)
+            try:
+                fps_value = int(fps)
+                if fps_value > 0:
+                    request['fps'] = fps_value
+            except (TypeError, ValueError):
+                pass
+            try:
+                link.add(op)
+                link.send(request)
+            except OSError:
+                link.mark_lost()
+                viewer.stop()
+                _gui_note('[!] GUI screen share: the session connection is gone.')
+                return
+            _gui_note('[+] GUI screen share started on session {} - open the '
+                      'Screen tab.'.format(link.number))
+            GUI_STATE.publish({'kind': 'open_screen'})
+            while not op.done.is_set() and not link.dead:
+                time.sleep(0.4)
+            if op.viewer is not None:
+                op.viewer.stop()
+                op.viewer = None
+            _gui_note('[+] GUI screen share ended.')
+        except Exception as exc:               # never die silently holding state
+            try:
+                if op is not None and op.viewer is not None:
+                    op.viewer.stop()
+                    op.viewer = None
+            except Exception:
+                pass
+            _gui_note('[!] GUI screen share error: {}'.format(exc))
+        finally:
+            GUI_STATE.screen_op = None
+            try:
+                link.drop(op)
+            except Exception:
+                pass
+            GUI_STATE.screen_lock.release()
+
+    threading.Thread(target=worker, name='gui-screenshare',
+                     daemon=True).start()
+    return {'ok': True, 'message': 'screen share starting'}
+
+
+def gui_screen_stop():
+    """Stop the GUI screen share (and any other live share) like 'stop'."""
+    stopped = 0
+    if GUI_STATE is not None:
+        op = GUI_STATE.screen_op
+        if op is not None and not op.done.is_set() and not op.stopping:
+            try:
+                op.cancel('GUI stop')
+                stopped += 1
+            except Exception:
+                pass
+    with SESSIONS_COND:
+        links = list(SESSIONS.values())
+    for link in links:
+        for op in link.snapshot():
+            if op.kind == 'screenshare' and not op.done.is_set() \
+                    and not op.stopping:
+                try:
+                    op.cancel('GUI stop')
+                    stopped += 1
+                except Exception:
+                    pass
+    return stopped
+
+
+def gui_switch_session(number):
+    """The click version of 'session <id>'."""
+    try:
+        number = int(number)
+    except (TypeError, ValueError):
+        return {'ok': False, 'error': 'bad session number'}
+    link, error = _switch_session(number)
+    if error:
+        return {'ok': False, 'error': error}
+    _gui_note('[+] Active session is now {} - {} ({}).   [gui: session {}]'
+              .format(number, _session_env_label(link),
+                      _fmt_addr(link.addr), number))
+    return {'ok': True, 'number': number,
+            'message': 'switched to session {}'.format(number)}
+
+
+def gui_cancel_transfer(serial=None, gui_id=None):
+    """The click version of 'cancel' for one transfer row."""
+    target = None
+    if gui_id and GUI_STATE is not None:
+        record = GUI_STATE.download_record(str(gui_id))
+        if record is not None:
+            target = record.get('op')
+    if target is None:
+        with SESSIONS_COND:
+            links = list(SESSIONS.values())
+        for link in links:
+            for op in link.snapshot():
+                if op.kind in ('upload', 'download', 'screenshare') \
+                        and not op.done.is_set() \
+                        and serial is not None \
+                        and op.transfer_serial == serial:
+                    target = op
+                    break
+            if target is not None:
+                break
+    if target is None:
+        return {'ok': False, 'error': 'that transfer is not running any more'}
+    try:
+        target.cancel('GUI stop')
+    except Exception as exc:
+        return {'ok': False, 'error': str(exc)}
+    _gui_note('[+] GUI stop requested: {}'.format(target.label))
+    return {'ok': True, 'message': 'stop requested'}
+
+
+class _GuiServer(getattr(http_server, 'ThreadingHTTPServer',
+                         http_server.HTTPServer)):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class _GuiRequestHandler(http_server.BaseHTTPRequestHandler):
+    server_version = 'CMonGUI/3'
+    protocol_version = 'HTTP/1.1'
+
+    def log_message(self, fmt, *args):
+        pass                            # the dashboard logs real events only
+
+    # -- small helpers -------------------------------------------------------
+    def _authorized(self):
+        token = GUI_SETTINGS.get('token') or ''
+        if not token:
+            return True
+        got = self.headers.get('X-Gui-Token') or ''
+        if not got and '?' in self.path:
+            for pair in self.path.split('?', 1)[1].split('&'):
+                key, _sep, value = pair.partition('=')
+                if key == 'token':
+                    got = unquote(value)
+        return bool(got) and secrets.compare_digest(got, token)
+
+    def _send(self, code, ctype, body, extra=()):
+        try:
+            self.send_response(code)
+            self.send_header('Content-Type', ctype)
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', 'no-store')
+            for key, value in extra:
+                self.send_header(key, value)
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    def _json(self, code, obj):
+        self._send(code, 'application/json; charset=utf-8',
+                   (json.dumps(obj) + '\n').encode('utf-8'))
+
+    def _read_json(self, limit=65536):
+        try:
+            length = int(self.headers.get('Content-Length') or 0)
+        except ValueError:
+            return None
+        if length <= 0 or length > limit:
+            return None
+        try:
+            data = json.loads(self.rfile.read(length).decode('utf-8', 'replace'))
+            return data if isinstance(data, dict) else None
+        except (OSError, ValueError):
+            return None
+
+    def _send_file(self, path, download_name, mime='application/octet-stream'):
+        """Stream a finished GUI file to the browser as a download."""
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return self._json(404, {'error': 'the file vanished'})
+        safe_name = ''.join(ch if ord(ch) < 128 and ch not in '"\\\r\n'
+                            else '_' for ch in download_name) or 'download.bin'
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', mime)
+            self.send_header('Content-Length', str(size))
+            self.send_header('Content-Disposition',
+                             'attachment; filename="{}"'.format(safe_name))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            with open(path, 'rb') as f:
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    # -- GET -------------------------------------------------------------------
+    def do_GET(self):
+        path = self.path.split('?', 1)[0]
+        query = {}
+        if '?' in self.path:
+            for pair in self.path.split('?', 1)[1].split('&'):
+                key, _sep, value = pair.partition('=')
+                if key:
+                    query[key] = unquote(value)
+        if path in ('/', '/index.html'):
+            self._send(200, 'text/html; charset=utf-8',
+                       _GUI_PAGE_HTML.encode('utf-8'))
+            return
+        if path == '/screen':
+            self._send(200, 'text/html; charset=utf-8',
+                       _GUI_SCREEN_HTML.encode('utf-8'))
+            return
+        if path == '/favicon.ico':
+            self._send(204, 'image/x-icon', b'')
+            return
+        if not self._authorized():
+            return self._json(401, {'error': 'unauthorized'})
+        if path == '/api/state':
+            self._json(200, GUI_STATE.state())
+            return
+        if path == '/api/log':
+            self._json(200, {'lines': GUI_STATE.tail()})
+            return
+        if path == '/api/events':
+            self._events()
+            return
+        if path == '/api/upex/autos':
+            self._json(200, {'autos': _gui_upex_autos()})
+            return
+        if path == '/api/files/list':
+            self._json(200, gui_files_list(query.get('path') or '~'))
+            return
+        if path == '/api/files/item':
+            self._files_item(query.get('id') or '')
+            return
+        if path == '/api/screenshot/latest':
+            self._screenshot_latest(query.get('id') or '')
+            return
+        if path == '/api/screen/stream':
+            self._screen_stream()
+            return
+        self._json(404, {'error': 'unknown path'})
+
+    def _files_item(self, did):
+        record = GUI_STATE.download_record(did)
+        if record is None:
+            return self._json(404, {'error': 'unknown download id'})
+        status = record.get('status')
+        if status == 'error':
+            return self._json(500, {'error': record.get('error') or 'failed'})
+        if status != 'ready':
+            return self._json(202, {'status': status or 'working'})
+        if record.get('kind') == 'dir':
+            zip_path = record.get('zip_path') or ''
+            if zip_path and os.path.isfile(zip_path):
+                return self._send_file(zip_path,
+                                       record['name'] + '.zip',
+                                       'application/zip')
+            return self._json(202, {'status': 'packing'})
+        ready = record.get('ready_path') or ''
+        if ready and os.path.isfile(ready):
+            return self._send_file(ready, record['name'])
+        return self._json(404, {'error': 'the file vanished'})
+
+    def _screenshot_latest(self, shot_id):
+        shot = (GUI_STATE.shot_by_id(shot_id) if shot_id
+                else GUI_STATE.last_shot())
+        if shot is None:
+            return self._json(404, {'error': 'no screenshot yet'})
+        try:
+            with open(shot['path'], 'rb') as f:
+                data = f.read()
+        except OSError:
+            return self._json(404, {'error': 'the screenshot vanished'})
+        self._send(200, 'image/jpeg', data)
+
+    def _screen_stream(self):
+        """Relay the live MJPEG stream of the active share through this
+        server, so the GUI page (and its second tab) need this port only."""
+        viewer = _gui_active_viewer()
+        if viewer is None or not getattr(viewer, 'url', None):
+            return self._json(404, {'error': 'no active screen share'})
+        import urllib.request
+        try:
+            upstream = urllib.request.urlopen(viewer.url + 'stream', timeout=20)
+        except Exception as exc:
+            return self._json(502, {'error': 'the viewer relay failed: '
+                                            '{}'.format(exc)})
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type',
+                             upstream.headers.get(
+                                 'Content-Type',
+                                 'multipart/x-mixed-replace; boundary=frame'))
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            self.close_connection = True
+            while True:
+                chunk = upstream.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
+            pass
+        finally:
+            try:
+                upstream.close()
+            except Exception:
+                pass
+
+    def _events(self):
+        """Server-sent events: live log lines, shell output, state refreshes."""
+        box = GUI_STATE.subscribe()
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            self.close_connection = True
+            self._sse('state', json.dumps(GUI_STATE.state()))
+            idle = 0.0
+            while True:
+                try:
+                    event = box.get(timeout=1.0)
+                    kind = event.get('kind')
+                    if kind == 'log':
+                        self._sse('log', json.dumps(event))
+                    elif kind == 'shell_out':
+                        self._sse('shell_out', json.dumps(event))
+                    elif kind == 'shot':
+                        self._sse('shot', json.dumps(event))
+                except queue.Empty:
+                    idle += 1.0
+                    if idle >= 2.0:
+                        idle = 0.0
+                        self._sse('state', json.dumps(GUI_STATE.state()))
+                    else:
+                        self.wfile.write(b': ping\n\n')
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
+            pass
+        finally:
+            GUI_STATE.unsubscribe(box)
+
+    def _sse(self, kind, payload):
+        self.wfile.write('event: {}\ndata: {}\n\n'.format(
+            kind, payload).encode('utf-8'))
+
+    # -- POST --------------------------------------------------------------------
+    def do_POST(self):
+        path = self.path.split('?', 1)[0]
+        if not self._authorized():
+            return self._json(401, {'error': 'unauthorized'})
+        if path == '/api/files/upload':
+            return self._upload_request()
+        data = self._read_json()
+        if path == '/api/cmd':
+            line = str((data or {}).get('line') or '')
+            if not line.strip():
+                return self._json(400, {'error': 'empty command'})
+            gui_submit_command(line)
+            self._json(200, {'ok': True, 'queued': True})
+            return
+        if path == '/api/shell/start':
+            started, message = gui_shell_start((data or {}).get('rows'),
+                                               (data or {}).get('cols'))
+            self._json(200 if started else 409,
+                       {'ok': started, 'message': message})
+            return
+        if path == '/api/shell/input':
+            payload = (data or {}).get('data')
+            if not isinstance(payload, str):
+                return self._json(400, {'error': 'data must be text'})
+            if GUI_STATE.shell.write_in(payload.encode('utf-8')):
+                self._json(200, {'ok': True})
+            else:
+                self._json(409, {'error': 'no active browser shell'})
+            return
+        if path == '/api/shell/stop':
+            stopped = GUI_STATE.shell.stop()
+            self._json(200, {'ok': True, 'stopped': stopped})
+            return
+        if path == '/api/session/switch':
+            result = gui_switch_session((data or {}).get('number'))
+            self._json(200 if result.get('ok') else 400, result)
+            return
+        if path == '/api/files/download':
+            result = gui_download_start((data or {}).get('path'))
+            self._json(200 if result.get('ok') else 400, result)
+            return
+        if path == '/api/screenshot':
+            result = gui_screenshot_start()
+            self._json(200 if result.get('ok') else 409, result)
+            return
+        if path == '/api/screen/start':
+            result = gui_screen_start((data or {}).get('fps'))
+            self._json(200 if result.get('ok') else 409, result)
+            return
+        if path == '/api/screen/stop':
+            stopped = gui_screen_stop()
+            self._json(200, {'ok': True, 'stopped': stopped})
+            return
+        if path == '/api/jobs/cancel':
+            result = gui_cancel_transfer((data or {}).get('serial'),
+                                         (data or {}).get('gui_id'))
+            self._json(200 if result.get('ok') else 404, result)
+            return
+        self._json(404, {'error': 'unknown path'})
+
+    def _upload_request(self):
+        try:
+            length = int(self.headers.get('Content-Length') or 0)
+        except ValueError:
+            return self._json(400, {'error': 'bad upload size'})
+        if length <= 0 or length > _GUI_UPLOAD_LIMIT:
+            return self._json(400, {'error': 'upload too large (limit 1 GiB)'})
+        try:
+            body = self.rfile.read(length)
+        except OSError:
+            return self._json(400, {'error': 'the upload was cut off'})
+        content_type = self.headers.get('Content-Type') or ''
+        if 'multipart/form-data' not in content_type:
+            return self._json(400, {'error': 'expected multipart/form-data'})
+        parts = _gui_parse_multipart(content_type, body)
+        if not parts:
+            return self._json(400, {'error': 'no file in the upload'})
+        # The query decides what to do: mode=upload (default), mode=uploaddir
+        # (a whole folder picked with the directory picker; every part keeps
+        # its path relative to the chosen folder) or mode=upex (Upload &
+        # Execute).  For upex the browser posts the app under the 'file'
+        # field and the picked auto launcher (auto.py / auto.cs / auto.js /
+        # auto.sh, or any .py/.cs/.js/.sh launcher) under 'auto'; hidden=1
+        # asks for hidden mode, which the backend only allows together with
+        # an auto launcher (exactly like 'upex -h auto.<type> <app>').
+        query = {}
+        if '?' in self.path:
+            for pair in self.path.split('?', 1)[1].split('&'):
+                key, _sep, value = pair.partition('=')
+                if key:
+                    query[unquote(key)] = unquote(value)
+        mode = query.get('mode') or 'upload'
+        if mode not in ('upload', 'uploaddir', 'upex'):
+            mode = 'upload'
+        if mode == 'uploaddir':
+            result = gui_upload_folder_start(parts)
+            return self._json(200 if result.get('ok') else 400, result)
+        if mode == 'upex':
+            auto_name = query.get('auto') or None
+            hidden = str(query.get('hidden') or '').lower() in ('1', 'true',
+                                                                'yes', 'on')
+            app_part = None
+            auto_part = None
+            for field, filename, data in parts:
+                if field == 'auto' and auto_part is None:
+                    auto_part = (filename, data)
+                elif field != 'auto' and app_part is None:
+                    app_part = (filename, data)
+            if app_part is None:
+                return self._json(400, {'error': 'no app file in the upload'})
+            filename, data = app_part
+            result = gui_upload_start(filename, data, mode='upex',
+                                      auto_name=auto_name, hidden=hidden,
+                                      auto_file=auto_part)
+            return self._json(200 if result.get('ok') else 400, result)
+        results = []
+        for _field, filename, data in parts:
+            results.append(gui_upload_start(filename, data, mode='upload'))
+        self._json(200, {'ok': all(r.get('ok') for r in results),
+                         'results': results})
+
+
+_GUI_PAGE_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CMon Controller — Interactive</title>
+<style>
+:root { color-scheme: dark; --bg:#0d1117; --panel:#10161d; --edge:#1d2733;
+  --edge2:#223041; --txt:#d7dde5; --dim:#7d8896; --dim2:#667484;
+  --good:#58d5a9; --goodbg:#17402f; --warn:#ffb454; --bad:#ff8f9a; }
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { margin: 0; background: var(--bg); color: var(--txt); min-height: 100vh;
+  font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+        "Helvetica Neue", Arial, sans-serif; }
+header { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline;
+  padding: 12px 18px; border-bottom: 1px solid var(--edge); background: var(--panel); }
+.brand { font-weight: 700; font-size: 17px; color: var(--good); letter-spacing: .3px; }
+.brand small { color: var(--dim); font-weight: 400; }
+.meta { margin-left: auto; color: var(--dim); font-size: 13px; display:flex; gap:14px; flex-wrap:wrap;}
+.meta b { color: #c8d1db; }
+.dot { display:inline-block; width:9px; height:9px; border-radius:50%;
+  background:#444; margin-right:5px; vertical-align:baseline;}
+.dot.on { background: var(--good); box-shadow:0 0 6px var(--good); }
+#app { display: grid; grid-template-columns: 320px minmax(0,1fr);
+  gap: 14px; padding: 14px 18px; align-items: start; }
+@media (max-width: 980px) { #app { grid-template-columns: 1fr; } }
+.col { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.card { background: var(--panel); border: 1px solid var(--edge); border-radius: 10px;
+  padding: 13px 15px; min-width: 0; }
+.card h2 { margin: 0 0 10px; font-size: 12.5px; text-transform: uppercase;
+  letter-spacing: .8px; color: #8fa1b3; display:flex; align-items:center; gap:8px;}
+.card h2 .pill { text-transform: none; letter-spacing: 0; margin-left: auto; }
+.hint { color: var(--dim2); font-size: 12.5px; margin: 4px 0 10px; }
+.sessions { display: flex; flex-direction: column; gap: 8px; }
+.sess { border: 1px solid var(--edge2); border-radius: 8px; padding: 9px 12px;
+  background: #0d141b; cursor: pointer; transition: border-color .15s, background .15s; }
+.sess:hover { border-color: #3a5570; }
+.sess.active { border-color: #2e6e54; background: #0e1a16; cursor: default; }
+.sess .row1 { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.sess .num { font-weight: 700; color: var(--good); }
+.sess .addr { color: #9aa8b6; font-family: ui-monospace, SFMono-Regular, Menlo,
+  Consolas, monospace; font-size: 12px; }
+.badge { font-size: 11px; padding: 1px 7px; border-radius: 20px;
+  background: var(--edge); color: #8fa1b3; }
+.badge.on { background: var(--goodbg); color: var(--good); }
+.sess .label { color: #b8c2cc; font-size: 13px; margin-top: 2px; }
+.sess .clicknote { color: var(--dim2); font-size: 11.5px; margin-top: 3px; }
+.empty { color: var(--dim2); padding: 8px 2px; }
+button { background: var(--goodbg); color: var(--good); border: 1px solid #2e6e54;
+  padding: 8px 13px; border-radius: 7px; cursor: pointer; font: inherit; }
+button:hover { filter: brightness(1.15); }
+button:disabled { opacity: .45; cursor: default; filter: none; }
+button.danger { background: #402226; border-color: #7d3a44; color: var(--bad); }
+button.key { padding: 5px 10px; font-size: 12.5px; background: #1a2230;
+  border-color: #2c3a4d; color: #a9b7c4; }
+button.wide { width: 100%; text-align: left; margin-bottom: 7px; }
+.row { display: flex; gap: 8px; align-items: center; }
+.row.wrap { flex-wrap: wrap; }
+input, select { flex: 1; background: #0b1117; border: 1px solid var(--edge2); color: #e6edf3;
+  border-radius: 7px; padding: 8px 11px; font: inherit; min-width: 0; }
+input:focus { outline: none; border-color: #2e6e54; }
+input[type=checkbox]{ flex:0 0 auto; min-width:0; width:15px; height:15px; margin:0; padding:0;
+  -webkit-appearance:none; appearance:none; background:#0b1117;
+  border:1px solid #2c3a4d; border-radius:4px; cursor:pointer; }
+input[type=checkbox]:hover{ border-color:#3a5570; }
+input[type=checkbox]:checked{ background:#17402f; border-color:#2e6e54;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3 8.5 6.5 12 13 4.5' fill='none' stroke='%2358d5a9' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-size:12px 12px; background-position:center; background-repeat:no-repeat; }
+input[type=checkbox]:disabled{ opacity:.4; cursor:default; }
+input[type=checkbox]:disabled:checked{ opacity:.6; }
+.spacer { flex: 1; }
+.pill { font-size: 11.5px; padding: 2px 9px; border-radius: 20px;
+  background: var(--edge); color: #8fa1b3; white-space: nowrap; }
+.pill.on { background: var(--goodbg); color: var(--good); }
+.pill.warn { background:#41301c; color: var(--warn); }
+.pill.bad { background:#402226; color: var(--bad); }
+.tabs { display: flex; gap: 6px; margin-bottom: 0; }
+.tabs button { background: var(--panel); border: 1px solid var(--edge); color: var(--dim);
+  border-radius: 9px 9px 0 0; border-bottom: none; padding: 9px 18px; font-weight: 600;}
+.tabs button:hover { color: var(--txt); }
+.tabs button.on { color: var(--good); background: #0d141b; }
+.tabbox { border: 1px solid var(--edge); border-radius: 0 10px 10px 10px;
+  background: var(--panel); padding: 13px 15px; min-height: 480px; }
+.term { background: #080d12; border: 1px solid #1a232e; border-radius: 8px;
+  padding: 10px 12px; overflow-y: auto; white-space: pre-wrap; word-break: break-word;
+  font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.term > div { min-height: 1.5em; }
+#term { height: 460px; outline: none; cursor: text; }
+#term.focus { border-color: #2e6e54; }
+#log { height: 430px; }
+.toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+table.files { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+table.files th { text-align: left; color: var(--dim2); font-weight: 600; font-size: 12px;
+  padding: 6px 8px; border-bottom: 1px solid var(--edge); position: sticky; top: 0;
+  background: var(--panel); }
+table.files td { padding: 6px 8px; border-bottom: 1px solid #141c26; }
+table.files tr.dir td.name { cursor: pointer; font-weight: 600; }
+table.files tr.file td.name { cursor: default; }
+table.files tr:hover td { background: #131b25; }
+.fname { display:flex; align-items:center; gap:8px; word-break: break-all; }
+.ficon { width: 18px; text-align: center; flex: 0 0 18px; }
+.dim { color: var(--dim2); font-size: 12px; }
+.ibtn { padding: 3px 9px; font-size: 13px; border-radius: 6px; background:#1a2230;
+  border-color:#2c3a4d; color:#a9b7c4; }
+.ibtn.go { color: var(--good); }
+#drop { border: 2px dashed #2c3a4d; border-radius: 8px; padding: 18px; text-align:center;
+  color: var(--dim2); margin-bottom: 10px; transition: all .15s; }
+#drop.over { border-color: var(--good); color: var(--good); background: #0e1a16; }
+.filescroll { overflow: auto; max-height: 520px; }
+.crumbs { display:flex; gap:2px; flex-wrap:wrap; align-items:center; margin-bottom:8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12.5px;}
+.crumb { color:#8fa1b3; cursor:pointer; padding:2px 6px; border-radius:5px; }
+.crumb:hover { background:#1a2230; color:var(--txt); }
+.crumb.last { color: var(--good); cursor: default; }
+.crumbsep { color:#3a4a5c; }
+.trow { display:flex; gap:8px; align-items:center; padding:7px 2px;
+  border-bottom:1px solid #141c26; font-size:12.5px; }
+.tname { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.tbar { height:5px; background:#141c26; border-radius:4px; overflow:hidden; margin-top:4px;}
+.tbar i { display:block; height:100%; background:var(--good); width:0%; transition:width .4s;}
+.tbar.stall i { background: var(--warn); }
+#shotimg { width:100%; border-radius:8px; border:1px solid var(--edge); cursor:zoom-in;
+  display:block; background:#080d12; min-height:60px; object-fit: contain; }
+#lightbox { position:fixed; inset:0; background:rgba(3,6,10,.92); display:none;
+  align-items:center; justify-content:center; z-index:50; cursor:zoom-out; padding:20px;}
+#lightbox img { max-width:96%; max-height:94%; border-radius:8px; }
+#toasts { position: fixed; right: 16px; bottom: 16px; display:flex; flex-direction:column;
+  gap:8px; z-index:60; max-width: 420px; }
+.toast { background:#141d27; border:1px solid #2c3a4d; border-left:4px solid var(--good);
+  color:var(--txt); padding:10px 14px; border-radius:8px; font-size:13px;
+  box-shadow:0 6px 20px rgba(0,0,0,.45); word-break:break-word;
+  animation: tin .18s ease-out; }
+.toast.warn { border-left-color: var(--warn); }
+.toast.bad { border-left-color: var(--bad); }
+@keyframes tin { from { transform: translateY(8px); opacity:0; } to { transform:none; opacity:1;} }
+footer { padding: 8px 20px 16px; color: #556474; font-size: 12px; }
+.hiddenfile { display:none; }
+.psym { color: var(--good); font-weight: 700; }
+.conline { white-space: pre-wrap; word-break: break-word; min-height: 19px; }
+.caret { display: inline-block; width: 8px; height: 14px; margin-left: 1px;
+  background: var(--good); vertical-align: text-bottom;
+  animation: conblink 1.1s steps(1) infinite; }
+@keyframes conblink { 50% { opacity: 0; } }
+#conterm { height: 480px; cursor: text; }
+#conterm.focus { border-color: #2e6e54; }
+.upexbox { border: 1px solid var(--edge2); border-radius: 8px; padding: 8px 10px;
+  margin: 8px 0 4px; font-size: 12.5px; }
+.upexbox summary { cursor: pointer; color: #8fa1b3; }
+.upexbox .row { margin: 7px 0 2px; }
+.upexbox select { background: #0b1117; border: 1px solid var(--edge2);
+  color: #e6edf3; border-radius: 6px; padding: 5px 8px; font: inherit; }
+.upexbox .dim { margin-top: 7px; line-height: 1.55; }
+#drop { cursor: pointer; }
+#drop:hover { border-color: #3a5570; color: #9aa8b6; }
+table.files tr td.act { white-space: nowrap; }
+</style>
+</head>
+"""
+_GUI_PAGE_HTML += r"""<body>
+<header>
+  <div class="brand">CMon Controller <small>interactive</small></div>
+  <div class="meta">
+    <span><span class="dot" id="livedot"></span><span id="livetxt">connecting</span></span>
+    <span>ctrl port <b id="cport">–</b></span>
+    <span><b id="sesscount">0 sessions</b></span>
+    <span>up <b id="uptime">0s</b></span>
+    <span id="queued"></span>
+  </div>
+</header>
+<div id="app">
+  <div class="col">
+    <div class="card">
+      <h2>Sessions <span class="pill" id="sesspill">–</span></h2>
+      <div id="sessions" class="sessions"><div class="empty">Waiting for a client to connect…</div></div>
+      <p class="hint">Click a session to jump to it (the controller runs
+        <b>session &lt;id&gt;</b> for you). Everything below acts on the
+        <b>active</b> session.</p>
+    </div>
+    <div class="card">
+      <h2>One-click actions</h2>
+      <button class="wide" id="btn-shot">📸 Screenshot</button>
+      <button class="wide" id="btn-screen">🖥 Screen share (opens a tab)</button>
+      <button class="wide" id="btn-upload">⬆ Upload file(s)…</button>
+      <button class="wide" id="btn-uploaddir">🗂 Upload a whole folder…</button>
+      <button class="wide" id="btn-upex">🚀 Upload &amp; execute (upex)…</button>
+      <input type="file" id="filepick" class="hiddenfile" multiple>
+      <input type="file" id="filepickdir" class="hiddenfile" webkitdirectory directory>
+      <input type="file" id="filepickapp" class="hiddenfile">
+      <input type="file" id="filepickauto" class="hiddenfile">
+      <details class="upexbox" id="upexopts">
+        <summary>upex — app file, auto launcher &amp; hidden mode</summary>
+        <div class="row">
+          <button class="key" id="btn-upex-app" type="button">📂 App file…</button>
+          <span class="dim" id="upexappname">none</span>
+        </div>
+        <div class="row">
+          <button class="key" id="btn-upex-auto" type="button">📂 Auto launcher…</button>
+          <span class="dim" id="upexautoname">none</span>
+        </div>
+        <label class="row" style="gap:6px;">
+          <input type="checkbox" id="upexhidden" disabled> hidden
+          (needs an auto launcher)</label>
+        <div class="row">
+          <button id="btn-upex-run" disabled>🚀 Run upex</button>
+        </div>
+        <div class="dim" id="upexcmd">upex &lt;app.ext&gt;</div>
+        <div class="dim">The app file is uploaded and executed (py / c / c++ /
+          cs / js / ts / swift / sh / bat / ps1 / vbs / exe / elf / macho).
+          With an auto launcher (.py / .cs / .js / .sh, like auto.sh) the
+          client runs the launcher with your app, and hidden runs it with no
+          visible window - the same as <b>upex -h auto.&lt;type&gt;
+          &lt;app&gt;</b> in the terminal. Type <b>upex</b> in the Console
+          tab for the full usage.</div>
+      </details>
+      <p class="hint" id="actionnote">Uploads arrive in the client's current
+        directory. upex uploads, then compiles/runs the file on the client.</p>
+    </div>
+    <div class="card">
+      <h2>Last screenshot</h2>
+      <img id="shotimg" alt="no screenshot yet" title="click to enlarge">
+      <p class="hint">Captured on the active session — click to enlarge.</p>
+    </div>
+    <div class="card">
+      <h2>Transfers <span class="pill" id="tcount">0</span></h2>
+      <div id="transfers"><div class="empty" id="tempty">No active transfers.</div></div>
+    </div>
+  </div>
+  <div class="col">
+    <div class="tabs">
+      <button id="tabbtn-shell" class="on" data-tab="shell">⌨ Shell</button>
+      <button id="tabbtn-files" data-tab="files">📁 Files</button>
+      <button id="tabbtn-console" data-tab="console">📜 Console</button>
+    </div>
+    <div class="tabbox">
+      <section id="tab-shell">
+        <div class="toolbar">
+          <button id="shellstart">Start shell</button>
+          <button id="shellstop" class="danger" disabled>Stop</button>
+          <span class="pill" id="shellstate">off</span>
+          <span class="spacer"></span>
+          <button class="key" data-key="C">Ctrl+C</button>
+          <button class="key" data-key="Z">Ctrl+Z</button>
+          <button class="key" data-key="D">Ctrl+D</button>
+          <button class="key" data-key="L">Ctrl+L</button>
+        </div>
+        <p class="hint">Click the black area, then type — every keystroke goes
+          to the client's PTY (same channel as the terminal <b>shell</b>).
+          Paste works too.</p>
+        <pre id="term" class="term" tabindex="0"></pre>
+        <form id="shform" class="row" style="margin-top:9px;">
+          <input id="shin" placeholder="or type a line here and press Enter" autocomplete="off" disabled>
+          <button type="submit" id="shsend" disabled>Send</button>
+        </form>
+      </section>
+      <section id="tab-files" hidden>
+        <div id="drop" title="click to browse your computer">Drop files here to
+          upload — or click to browse your computer</div>
+        <div class="toolbar">
+          <button class="ibtn" id="btn-home" title="client home">🏠</button>
+          <button class="ibtn" id="btn-up" title="parent folder">⬆</button>
+          <button class="ibtn" id="btn-reload" title="reload">🔄</button>
+          <input id="pathbox" placeholder="~" spellcheck="false">
+          <button id="btn-go">Go</button>
+          <label class="dim" style="display:flex;gap:5px;align-items:center;">
+            <input type="checkbox" id="showhidden" checked> hidden</label>
+        </div>
+        <div class="toolbar">
+          <button class="key" id="btn-pick">📂 Browse files…</button>
+          <button class="key" id="btn-pickdir">🗂 Browse a folder…</button>
+          <span class="dim">picked files upload to the folder you are viewing</span>
+        </div>
+        <div class="crumbs" id="crumbs"></div>
+        <div class="filescroll">
+          <table class="files">
+            <thead><tr><th style="width:26px;"></th><th>Name</th>
+              <th style="width:110px;">Size</th><th style="width:160px;">Modified</th>
+              <th style="width:70px;"></th></tr></thead>
+            <tbody id="filebody"><tr><td colspan="5" class="dim">Loading…</td></tr></tbody>
+          </table>
+        </div>
+        <p class="hint" id="filesnote">The list is fetched invisibly (a hidden
+          listing command on the client — hidden files included). The ⬇ icon
+          downloads with the normal streamed transfer, then your browser
+          saves it (folders arrive as .zip). Click a folder name to open it,
+          double-click a file name to download it.</p>
+      </section>
+      <section id="tab-console" hidden>
+        <p class="hint">The controller prompt <b>inside</b> the page: click
+          the terminal below and type — Enter runs the command on the active
+          session, ↑/↓ walks the history, Tab completes, Ctrl+L clears.
+          <b>shell</b> here opens the interactive shell in the Shell tab;
+          <b>screenshare</b> opens the live tab.</p>
+        <div class="toolbar">
+          <button class="key" data-cmd="session">session</button>
+          <button class="key" data-cmd="jobs">jobs</button>
+          <button class="key" data-cmd="show options">show options</button>
+          <button class="key" data-cmd="upex">upex help</button>
+          <button class="key" data-cmd="shell">shell</button>
+          <span class="spacer"></span>
+          <button class="key" id="conclear">Clear</button>
+        </div>
+        <div id="conterm" class="term" tabindex="0"></div>
+      </section>
+    </div>
+  </div>
+</div>
+<div id="lightbox"><img id="lightimg" alt=""></div>
+<div id="toasts"></div>
+<footer>Terminal and browser work side by side — whatever you click here, the
+  prompt could have typed itself.</footer>
+"""
+_GUI_PAGE_HTML += r"""<script>
+(function () {
+  'use strict';
+  var $ = function (id) { return document.getElementById(id); };
+  var token = new URLSearchParams(location.search).get('token') || '';
+  var qs = token ? ('?token=' + encodeURIComponent(token)) : '';
+  var S = {
+    state: null,
+    tab: 'shell',
+    path: '~',
+    hidden: true,
+    listToken: 0,
+    lastShotId: '',
+    shellVersion: -1,
+    dlWatch: {}
+  };
+
+  // ---------- tiny helpers -------------------------------------------------
+  function post(path, body) {
+    return fetch(path + qs, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Gui-Token': token },
+      body: JSON.stringify(body || {})
+    }).then(function (r) { return r.json(); })
+      .catch(function () { return { error: 'network error' }; });
+  }
+  function toast(text, kind, ms) {
+    var box = $('toasts');
+    var el = document.createElement('div');
+    el.className = 'toast' + (kind ? ' ' + kind : '');
+    el.textContent = text;
+    box.appendChild(el);
+    setTimeout(function () {
+      el.style.opacity = '0';
+      el.style.transition = 'opacity .3s';
+      setTimeout(function () { el.remove(); }, 350);
+    }, ms || 4200);
+  }
+  function esc(text) {
+    return String(text == null ? '' : text).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
+  }
+  function fmtBytes(n) {
+    if (n === null || n === undefined || isNaN(n)) return '—';
+    if (n < 0) return '?';
+    var units = ['B', 'KB', 'MB', 'GB', 'TB'], i = 0, v = n;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return (i ? v.toFixed(1) : v.toFixed(0)) + ' ' + units[i];
+  }
+  function fmtTime(ts) {
+    if (!ts) return '—';
+    var d = new Date(ts * 1000);
+    function p(x) { return (x < 10 ? '0' : '') + x; }
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
+      ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+  function fmtUptime(s) {
+    s = s | 0;
+    var m = Math.floor(s / 60), h = Math.floor(m / 60);
+    if (h) return h + 'h' + (m % 60) + 'm';
+    if (m) return m + 'm' + (s % 60) + 's';
+    return s + 's';
+  }
+  function nearBottom(el) {
+    return el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  }
+  // ---------- Shell tab terminal --------------------------------------------
+  // A remote shell redraws: it echoes each keystroke, rewinds the line with
+  // \r, fixes typos with \b and breaks lines with \n.  Rendering every
+  // network chunk as its own div stacked the echoed letters vertically (one
+  // per chunk) - the "l / s" GUI bug.  The terminal keeps a proper line
+  // model instead and updates the last line in place.
+  var TERM = { lines: [''], cursor: 0 };
+  function termReset() {
+    TERM.lines = [''];
+    TERM.cursor = 0;
+    var el = $('term');
+    el.innerHTML = '';
+    el.scrollTop = 0;
+  }
+  function termPaint() {
+    var el = $('term');
+    var lines = TERM.lines;
+    var stick = nearBottom(el);
+    while (el.childNodes.length > lines.length) {
+      el.removeChild(el.firstChild);
+    }
+    while (el.childNodes.length < lines.length) {
+      el.appendChild(document.createElement('div'));
+    }
+    // Only the tail can have changed; syncing a few lines keeps typing cheap.
+    var from = Math.max(0, lines.length - 4);
+    for (var i = from; i < lines.length; i++) {
+      el.childNodes[i].textContent = lines[i];
+    }
+    if (stick) el.scrollTop = el.scrollHeight;
+  }
+  function termWrite(text) {
+    if (!text) return;
+    var lines = TERM.lines;
+    var line = lines[lines.length - 1];
+    var cursor = TERM.cursor;
+    if (line === undefined) { line = ''; lines.push(''); }
+    for (var i = 0; i < text.length; i++) {
+      var ch = text.charAt(i);
+      if (ch === '\n') {
+        lines[lines.length - 1] = line;
+        lines.push('');
+        line = '';
+        cursor = 0;
+        continue;
+      }
+      if (ch === '\r') { cursor = 0; continue; }
+      if (ch === '\b') { if (cursor > 0) cursor -= 1; continue; }
+      if (ch === '\x01') {                     // EL: cut the line at the cursor
+        line = line.slice(0, cursor);
+        continue;
+      }
+      if (ch === '\x02') {                     // ED: clear the screen
+        lines.length = 1;
+        lines[0] = '';
+        line = '';
+        cursor = 0;
+        $('term').innerHTML = '';
+        continue;
+      }
+      if (ch === '\t') {
+        var stop = 8 - (cursor % 8);
+        while (stop-- > 0) {
+          line = line.slice(0, cursor) + ' '
+            + (cursor < line.length ? line.slice(cursor + 1) : '');
+          cursor += 1;
+        }
+        continue;
+      }
+      if (ch < ' ') continue;
+      line = line.slice(0, cursor) + ch
+        + (cursor < line.length ? line.slice(cursor + 1) : '');
+      cursor += 1;
+    }
+    lines[lines.length - 1] = line;
+    TERM.cursor = cursor;
+    while (lines.length > 2000) {
+      lines.shift();
+      var first = $('term').firstChild;
+      if (first) $('term').removeChild(first);
+    }
+    termPaint();
+  }
+  var noteTimer = null;
+  function note(text) {
+    $('actionnote').textContent = text;
+    clearTimeout(noteTimer);
+    noteTimer = setTimeout(function () {
+      $('actionnote').textContent = 'Uploads arrive in the client\u2019s current ' +
+        'directory. upex uploads, then compiles/runs the file on the client.';
+    }, 8000);
+  }
+
+  // ---------- state rendering ----------------------------------------------
+  function renderState(st) {
+    if (!st) return;
+    S.state = st;
+    $('livedot').className = 'dot on';
+    $('livetxt').textContent = 'live';
+    $('cport').textContent = st.port;
+    $('uptime').textContent = fmtUptime(st.uptime_s);
+    var sessions = st.sessions || [];
+    $('sesscount').textContent = sessions.length +
+      (sessions.length === 1 ? ' session' : ' sessions');
+    $('sesspill').textContent = sessions.length ? sessions.length + ' live' : 'none';
+    $('queued').textContent = st.queued_commands
+      ? (st.queued_commands + ' queued') : '';
+    renderSessions(sessions);
+    renderTransfers(st.transfers || []);
+    renderShellBit(st.shell || {});
+    renderScreenBit(st.screen || {});
+    if (st.last_shot && st.last_shot.id !== S.lastShotId) {
+      S.lastShotId = st.last_shot.id;
+      $('shotimg').src = '/api/screenshot/latest?id=' + st.last_shot.id + qs;
+    }
+  }
+
+  function renderSessions(sessions) {
+    var box = $('sessions');
+    if (!sessions.length) {
+      box.innerHTML = '<div class="empty">Waiting for a client to connect\u2026</div>';
+      return;
+    }
+    box.innerHTML = '';
+    sessions.forEach(function (s) {
+      var d = document.createElement('div');
+      d.className = 'sess' + (s.active ? ' active' : '');
+      d.innerHTML = '<div class="row1">' +
+        '<span class="num">#' + s.number + '</span>' +
+        '<span class="addr">' + esc(s.address) + '</span>' +
+        (s.active ? '<span class="badge on">active</span>' : '') +
+        '<span class="badge">' + esc(s.os) + '</span></div>' +
+        '<div class="label">' + esc(s.label) + '</div>' +
+        (s.active ? '' : '<div class="clicknote">click to switch</div>');
+      if (!s.active) {
+        d.addEventListener('click', function () {
+          post('/api/session/switch', { number: s.number }).then(function (r) {
+            if (r && r.ok) toast('Switched to session ' + s.number +
+              '  (hidden: session ' + s.number + ')');
+            else toast((r && r.error) || 'switch failed', 'bad');
+          });
+        });
+      }
+      box.appendChild(d);
+    });
+  }
+
+  function transferRow(t) {
+    var row = document.createElement('div');
+    row.className = 'trow';
+    var icon = t.kind === 'screenshare' ? '🖥' :
+      (t.kind === 'upload' ? '⬆' : '⬇');
+    var pct = null;
+    if (t.kind !== 'screenshare' && t.total > 0) {
+      pct = Math.min(100, Math.round(100 * (t.done || 0) / t.total));
+    }
+    var status = t.status || 'running';
+    var left = document.createElement('div');
+    left.style.flex = '1';
+    left.style.minWidth = '0';
+    left.innerHTML = '<div class="tname">' + icon + ' ' + esc(t.name) +
+      '</div><div class="dim">' + esc(status) +
+      (t.kind !== 'screenshare' ? ' · ' + fmtBytes(t.done) +
+        (t.total ? ' / ' + fmtBytes(t.total) : '') : '') +
+      (t.error ? ' · <span style="color:var(--bad)">' + esc(t.error) + '</span>' : '') +
+      '</div>' + (pct !== null ? '<div class="tbar"><i style="width:' + pct + '%"></i></div>' : '');
+    row.appendChild(left);
+    var stop = document.createElement('button');
+    stop.className = 'ibtn';
+    stop.textContent = '✕';
+    stop.title = 'stop this transfer';
+    stop.addEventListener('click', function () {
+      post('/api/jobs/cancel', { serial: t.serial, gui_id: t.gui_id })
+        .then(function (r) {
+          if (r && r.ok) toast('Stop requested');
+          else toast((r && r.error) || 'could not stop', 'warn');
+        });
+    });
+    row.appendChild(stop);
+    return row;
+  }
+
+  function renderTransfers(transfers) {
+    var box = $('transfers');
+    $('tcount').textContent = String(transfers.length);
+    if (!transfers.length) {
+      box.innerHTML = '<div class="empty">No active transfers.</div>';
+      Object.keys(S.dlWatch).forEach(function (id) {
+        var watcher = S.dlWatch[id];
+        if (!transfers.some(function (t) { return t.gui_id === id; })) {
+          delete S.dlWatch[id];
+        }
+      });
+      return;
+    }
+    box.innerHTML = '';
+    transfers.forEach(function (t) { box.appendChild(transferRow(t)); });
+    // watch GUI downloads: when ready, hand the file to the browser
+    transfers.forEach(function (t) {
+      if (t.gui_id && t.status === 'ready' && S.dlWatch[t.gui_id]) {
+        var watcher = S.dlWatch[t.gui_id];
+        delete S.dlWatch[t.gui_id];
+        fetch('/api/files/item?id=' + t.gui_id + qs,
+              { headers: { 'X-Gui-Token': token } })
+          .then(function (r) {
+            if (!r.ok) throw new Error('fetch failed');
+            return r.blob();
+          })
+          .then(function (blob) {
+            var url = URL.createObjectURL(blob);
+            var a = document.createElement('a');
+            a.href = url;
+            a.download = watcher.name;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(function () { URL.revokeObjectURL(url); }, 20000);
+            toast('Download ready: ' + watcher.name);
+          })
+          .catch(function () { toast('Could not fetch ' + watcher.name, 'bad'); });
+      }
+    });
+  }
+
+  function renderShellBit(shell) {
+    var active = !!shell.active;
+    var pill = $('shellstate');
+    pill.textContent = active ? ('live · ' + (shell.client_os || 'target')) : 'off';
+    pill.className = 'pill' + (active ? ' on' : '');
+    $('shellstart').disabled = active || !(S.state && S.state.sessions.length);
+    $('shellstop').disabled = !active;
+    $('shin').disabled = !active;
+    $('shsend').disabled = !active;
+    if (active) {
+      if (shell.version !== S.shellVersion && !$('term').dataset.seeded) {
+        termReset();
+        termWrite((shell.tail || []).join(''));
+        $('term').dataset.seeded = '1';
+      }
+      S.shellVersion = shell.version;
+    } else {
+      delete $('term').dataset.seeded;
+      S.shellVersion = -1;
+    }
+  }
+
+  function renderScreenBit(screen) {
+    var btn = $('btn-screen');
+    if (screen.active) {
+      btn.textContent = '🖥 Screen share live (' + screen.frames + ' frames)';
+    } else {
+      btn.textContent = '🖥 Screen share (opens a tab)';
+    }
+  }
+
+  // ---------- actions -------------------------------------------------------
+  $('btn-shot').addEventListener('click', function () {
+    post('/api/screenshot', {}).then(function (r) {
+      if (r && r.ok) { toast('Capturing screenshot…'); }
+      else toast((r && r.error) || 'screenshot failed', 'bad');
+    });
+  });
+
+  $('btn-screen').addEventListener('click', function () {
+    post('/api/screen/start', {}).then(function (r) {
+      if (r && r.ok) {
+        toast('Screen share starting — opening the Screen tab…');
+        window.open('/screen' + qs, 'cmonscreen');
+      } else if (r && /already running/.test(r.error || '')) {
+        window.open('/screen' + qs, 'cmonscreen');
+        toast('Share already running — opened the tab');
+      } else {
+        toast((r && r.error) || 'could not start the screen share', 'bad');
+      }
+    });
+  });
+
+  $('shotimg').addEventListener('click', function () {
+    if (!$('shotimg').src || $('shotimg').src.indexOf('screenshot') < 0) return;
+    $('lightimg').src = $('shotimg').src;
+    $('lightbox').style.display = 'flex';
+  });
+  $('lightbox').addEventListener('click', function () {
+    $('lightbox').style.display = 'none';
+  });
+  $('shotimg').addEventListener('error', function () {
+    $('shotimg').removeAttribute('src');
+  });
+"""
+_GUI_PAGE_HTML += r"""
+  // ---------- files tab -----------------------------------------------------
+  function sepJoin(base, name) {
+    var sep = (S.lastSep || '/');
+    if (/[\\\/]$/.test(base)) return base + name;
+    return base + sep + name;
+  }
+  function loadFiles(path) {
+    S.path = path || S.path;
+    var myToken = ++S.listToken;
+    $('filebody').innerHTML = '<tr><td colspan="5" class="dim">Listing…</td></tr>';
+    var url = '/api/files/list?path=' + encodeURIComponent(S.path) +
+      (token ? '&token=' + encodeURIComponent(token) : '');
+    fetch(url, { headers: { 'X-Gui-Token': token } })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (myToken !== S.listToken) return;
+        renderFiles(data);
+      })
+      .catch(function () {
+        if (myToken === S.listToken)
+          $('filebody').innerHTML = '<tr><td colspan="5" class="dim">Listing failed.</td></tr>';
+      });
+  }
+  function renderFiles(data) {
+    if (!data || !data.ok) {
+      $('filebody').innerHTML = '<tr><td colspan="5" class="dim">' +
+        esc((data && data.error) || 'listing failed') + '</td></tr>';
+      $('crumbs').innerHTML = '';
+      return;
+    }
+    S.lastSep = data.sep || '/';
+    S.path = data.path || S.path;
+    $('pathbox').value = S.path;
+    renderCrumbs();
+    var rows = (data.entries || []).filter(function (e) {
+      return S.hidden || !e.h;
+    });
+    if (!rows.length) {
+      $('filebody').innerHTML = '<tr><td colspan="5" class="dim">Empty folder.</td></tr>';
+      return;
+    }
+    var body = $('filebody');
+    body.innerHTML = '';
+    rows.forEach(function (e) {
+      var tr = document.createElement('tr');
+      tr.className = e.k;
+      var isDir = e.k === 'dir';
+      tr.innerHTML =
+        '<td class="ficon">' + (isDir ? '📁' : '📄') + '</td>' +
+        '<td class="name"><span class="fname">' + esc(e.n) +
+          (e.h ? ' <span class="dim">(hidden)</span>' : '') + '</span></td>' +
+        '<td class="dim">' + (isDir ? '—' : fmtBytes(e.s)) + '</td>' +
+        '<td class="dim">' + (e.m ? fmtTime(e.m) : '—') + '</td>' +
+        '<td class="act"><button class="ibtn go" title="' +
+          (isDir ? 'download this folder (arrives as .zip)'
+                 : 'download this file') + '">⬇</button></td>';
+      if (isDir) {
+        tr.querySelector('.name').addEventListener('click', function () {
+          loadFiles(sepJoin(S.path, e.n));
+        });
+      } else {
+        tr.querySelector('.name').addEventListener('dblclick', function () {
+          startDownload(sepJoin(S.path, e.n), e.n);
+        });
+      }
+      tr.querySelector('button').addEventListener('click', function () {
+        startDownload(sepJoin(S.path, e.n), e.n);
+      });
+      body.appendChild(tr);
+    });
+  }
+  function renderCrumbs() {
+    var box = $('crumbs');
+    box.innerHTML = '';
+    var sep = S.lastSep || '/';
+    var home = document.createElement('span');
+    home.className = 'crumb';
+    home.textContent = '🏠 ~';
+    home.addEventListener('click', function () { loadFiles('~'); });
+    box.appendChild(home);
+    if (!S.path || S.path === '~') return;
+    var parts = S.path.split(/[\\\/]/).filter(function (p) { return p !== ''; });
+    var acc = (S.path.charAt(0) === '/' ? '/' :
+      (sep === '\\' && /^[A-Za-z]:/.test(S.path) ? '' : ''));
+    parts.forEach(function (part, idx) {
+      acc = acc ? (/[\\\/]$/.test(acc) ? acc + part : acc + sep + part)
+                : (part + (sep === '\\' ? '\\' : ''));
+      if (sep === '\\' && idx === 0 && /^[A-Za-z]:$/.test(part)) {
+        acc = part + '\\';
+      }
+      var piece = document.createElement('span');
+      piece.className = 'crumb' + (idx === parts.length - 1 ? ' last' : '');
+      piece.textContent = part;
+      if (idx !== parts.length - 1) {
+        (function (target) {
+          piece.addEventListener('click', function () { loadFiles(target); });
+        })(acc);
+      }
+      box.appendChild(piece);
+      if (idx !== parts.length - 1) {
+        var sepc = document.createElement('span');
+        sepc.className = 'crumbsep';
+        sepc.textContent = sep;
+        box.appendChild(sepc);
+      }
+    });
+  }
+  function startDownload(remotePath, name) {
+    post('/api/files/download', { path: remotePath }).then(function (r) {
+      if (r && r.ok) {
+        S.dlWatch[r.id] = { name: name };
+        toast('Downloading ' + name + '… (browser saves it when ready)');
+        refreshSoon();
+      } else {
+        toast((r && r.error) || 'download failed', 'bad');
+      }
+    });
+  }
+  $('btn-up').addEventListener('click', function () {
+    var p = S.path || '~';
+    if (p === '~') { loadFiles('~'); return; }
+    var cut = p.replace(/[\\\/][^\\\/]*[\\\/]?$/, '') ||
+      (p.charAt(0) === '/' ? '/' : p);
+    loadFiles(cut || '/');
+  });
+  $('btn-home').addEventListener('click', function () { loadFiles('~'); });
+  $('btn-reload').addEventListener('click', function () { loadFiles(); });
+  $('btn-go').addEventListener('click', function () {
+    loadFiles($('pathbox').value.trim() || '~');
+  });
+  $('pathbox').addEventListener('keydown', function (ev) {
+    if (ev.key === 'Enter') { ev.preventDefault(); loadFiles($('pathbox').value.trim() || '~'); }
+  });
+  $('showhidden').addEventListener('change', function () {
+    S.hidden = $('showhidden').checked;
+    loadFiles();
+  });
+
+  function uploadUrl(params) {
+    var parts = [];
+    Object.keys(params || {}).forEach(function (key) {
+      if (params[key] !== undefined && params[key] !== null && params[key] !== '')
+        parts.push(encodeURIComponent(key) + '=' + encodeURIComponent(params[key]));
+    });
+    if (token) parts.push('token=' + encodeURIComponent(token));
+    return '/api/files/upload' + (parts.length ? '?' + parts.join('&') : '');
+  }
+  // ---------- upex: app file + auto launcher + hidden ----------------------
+  // Rules (mirroring the terminal):
+  //   upex <app.ext>                      app only
+  //   upex auto.<type> <app.ext>          app + auto launcher
+  //   upex -h auto.<type> <app.ext>       app + auto launcher, hidden
+  // The hidden checkbox can only be ticked while an auto launcher (a
+  // .py/.cs/.js/.sh file) is selected.
+  var UPEX = { app: null, auto: null };
+  function upexFileExt(name) {
+    name = String(name || '');
+    var dot = name.lastIndexOf('.');
+    return dot < 0 ? '' : name.slice(dot + 1).toLowerCase();
+  }
+  function upexAutoExt() {
+    if (!UPEX.auto) return '';
+    var ext = upexFileExt(UPEX.auto.name);
+    return (ext === 'py' || ext === 'cs' || ext === 'js' || ext === 'sh')
+      ? ext : '';
+  }
+  function upexRefresh() {
+    var appName = UPEX.app ? UPEX.app.name : '';
+    var autoExt = upexAutoExt();
+    var hasAuto = !!(UPEX.auto && autoExt);
+    // Without a valid auto launcher the hidden box cannot be ticked.
+    $('upexhidden').disabled = !hasAuto;
+    if (!hasAuto) $('upexhidden').checked = false;
+    $('upexappname').textContent = appName || 'none';
+    $('upexautoname').textContent =
+      UPEX.auto ? (UPEX.auto.name || 'auto') : 'none';
+    $('btn-upex-run').disabled = !UPEX.app;
+    var cmd = 'upex';
+    if (hasAuto && $('upexhidden').checked) cmd += ' -h';
+    if (hasAuto) cmd += ' auto.' + autoExt;
+    cmd += ' ' + (appName || '<app.ext>');
+    $('upexcmd').textContent = cmd;
+  }
+  $('btn-upex-app').addEventListener('click', function () {
+    $('filepickapp').click();
+  });
+  $('btn-upex-auto').addEventListener('click', function () {
+    $('filepickauto').click();
+  });
+  $('filepickapp').addEventListener('change', function () {
+    UPEX.app = ($('filepickapp').files && $('filepickapp').files[0]) || null;
+    if (UPEX.app) toast('App file: ' + UPEX.app.name);
+    upexRefresh();
+  });
+  $('filepickauto').addEventListener('change', function () {
+    var file = ($('filepickauto').files && $('filepickauto').files[0]) || null;
+    var ext = upexFileExt(file && file.name);
+    if (file && !(ext === 'py' || ext === 'cs' || ext === 'js' || ext === 'sh')) {
+      toast('The auto launcher must be a .py, .cs, .js or .sh file '
+        + '(like auto.sh)', 'bad');
+      $('filepickauto').value = '';
+      UPEX.auto = null;
+      upexRefresh();
+      return;
+    }
+    UPEX.auto = file;
+    if (file) toast('Auto launcher: ' + file.name);
+    upexRefresh();
+  });
+  $('upexhidden').addEventListener('change', upexRefresh);
+  $('btn-upex-run').addEventListener('click', function () {
+    if (!UPEX.app) return;
+    var form = new FormData();
+    form.append('file', UPEX.app, UPEX.app.name);
+    var params = { mode: 'upex' };
+    if (upexAutoExt()) {
+      form.append('auto', UPEX.auto, UPEX.auto.name);
+      if ($('upexhidden').checked) params.hidden = 1;
+    }
+    note('Running upex on ' + UPEX.app.name + '…');
+    fetch(uploadUrl(params),
+          { method: 'POST', headers: { 'X-Gui-Token': token }, body: form })
+      .then(function (r) { return r.json(); })
+      .then(function (r) {
+        if (r && r.ok) {
+          toast('upex started: ' + (r.command || r.message || ''));
+          UPEX.app = null;
+          UPEX.auto = null;
+          $('filepickapp').value = '';
+          $('filepickauto').value = '';
+          upexRefresh();
+          switchTab('console');
+          refreshSoon();
+        } else {
+          toast((r && r.error) || 'upex failed', 'bad');
+        }
+      })
+      .catch(function () { toast('upex failed: network error', 'bad'); });
+  });
+  upexRefresh();
+  function uploadFiles(fileList, mode) {
+    var files = Array.prototype.slice.call(fileList || []);
+    if (!files.length) return;
+    if (mode === 'folder') {
+      // A whole local folder: every part keeps its relative path, the
+      // controller rebuilds the tree and runs one real folder upload.
+      var form = new FormData();
+      files.forEach(function (file) {
+        form.append('file', file,
+          (file.webkitRelativePath || file.name));
+      });
+      note('Uploading folder (' + files.length + ' files)…');
+      fetch(uploadUrl({ mode: 'uploaddir' }),
+            { method: 'POST', headers: { 'X-Gui-Token': token }, body: form })
+        .then(function (r) { return r.json(); })
+        .then(function (r) {
+          if (r && r.ok) { toast(r.message || 'Folder upload started'); refreshSoon(); }
+          else toast((r && r.error) || 'folder upload failed', 'bad');
+        })
+        .catch(function () { toast('upload failed: network error', 'bad'); });
+      return;
+    }
+    files.forEach(function (file) {
+      var form = new FormData();
+      form.append('file', file, file.name);
+      note('Uploading ' + file.name + ' (' + fmtBytes(file.size) + ')…');
+      fetch(uploadUrl({}),
+            { method: 'POST', headers: { 'X-Gui-Token': token }, body: form })
+        .then(function (r) { return r.json(); })
+        .then(function (r) {
+          if (r && r.ok) {
+            toast('Uploading ' + file.name);
+            refreshSoon();
+          } else {
+            toast((r && r.error) || 'upload failed', 'bad');
+          }
+        })
+        .catch(function () { toast('upload failed: network error', 'bad'); });
+    });
+  }
+  $('btn-upload').addEventListener('click', function () { $('filepick').click(); });
+  $('btn-uploaddir').addEventListener('click', function () { $('filepickdir').click(); });
+  $('btn-pick').addEventListener('click', function () { $('filepick').click(); });
+  $('btn-pickdir').addEventListener('click', function () { $('filepickdir').click(); });
+  // The sidebar upex button opens the options box: the app file, the auto
+  // launcher and the hidden tick are chosen there, then Run upex submits.
+  $('btn-upex').addEventListener('click', function () {
+    $('upexopts').open = true;
+    upexRefresh();
+    toast('Choose the app file (and an optional auto launcher), '
+      + 'then Run upex');
+  });
+  $('upexopts').addEventListener('toggle', function () {
+    if ($('upexopts').open) upexRefresh();
+  });
+  $('filepick').addEventListener('change', function () {
+    uploadFiles($('filepick').files, 'upload');
+    $('filepick').value = '';
+  });
+  $('filepickdir').addEventListener('change', function () {
+    uploadFiles($('filepickdir').files, 'folder');
+    $('filepickdir').value = '';
+  });
+  var drop = $('drop');
+  drop.addEventListener('click', function () { $('filepick').click(); });
+  ['dragenter', 'dragover'].forEach(function (name) {
+    drop.addEventListener(name, function (ev) {
+      ev.preventDefault();
+      drop.className = 'over';
+    });
+  });
+  ['dragleave', 'drop'].forEach(function (name) {
+    drop.addEventListener(name, function (ev) {
+      ev.preventDefault();
+      drop.className = '';
+    });
+  });
+  drop.addEventListener('drop', function (ev) {
+    if (ev.dataTransfer && ev.dataTransfer.files.length) {
+      uploadFiles(ev.dataTransfer.files, 'upload');
+    }
+  });
+
+  function refreshSoon() {
+    setTimeout(function () {
+      fetch('/api/state' + qs, { headers: { 'X-Gui-Token': token } })
+        .then(function (r) { return r.json(); })
+        .then(renderState)
+        .catch(function () {});
+    }, 350);
+  }
+"""
+_GUI_PAGE_HTML += r"""
+  // ---------- shell tab -----------------------------------------------------
+  var keyMap = {
+    Enter: '\r', Backspace: '\x7f', Tab: '\t', Escape: '\x1b',
+    ArrowUp: '\x1b[A', ArrowDown: '\x1b[B', ArrowRight: '\x1b[C',
+    ArrowLeft: '\x1b[D', Home: '\x1b[H', End: '\x1b[F',
+    Delete: '\x1b[3~', PageUp: '\x1b[5~', PageDown: '\x1b[6~',
+    Insert: '\x1b[2~'
+  };
+  // Keystrokes must reach the client in exactly the order they were typed.
+  // Separate fetch() calls can race on pooled connections (a fast "echo hi"
+  // once arrived as "ehco hi"), so keys are batched for a few milliseconds
+  // and every batch is chained behind the previous one.
+  var shellPend = '';
+  var shellTimer = null;
+  var shellChain = Promise.resolve();
+  function shellSend(data) {
+    if (!data) return;
+    shellPend += data;
+    if (shellTimer === null) {
+      shellTimer = setTimeout(function () {
+        shellTimer = null;
+        var batch = shellPend;
+        shellPend = '';
+        shellChain = shellChain.then(function () {
+          return post('/api/shell/input', { data: batch })
+            .catch(function () {});
+        });
+      }, 12);
+    }
+  }
+  $('term').addEventListener('keydown', function (ev) {
+    if (!$('term').dataset.seeded && !$('shellstate').className.match('on')) return;
+    if (ev.ctrlKey && ev.altKey) return;
+    if (ev.ctrlKey && !ev.shiftKey && ev.key.length === 1) {
+      var code = ev.key.toUpperCase().charCodeAt(0) - 64;
+      if (code >= 1 && code <= 26) {
+        ev.preventDefault();
+        shellSend(String.fromCharCode(code));
+      }
+      return;
+    }
+    if (keyMap[ev.key] !== undefined) {
+      ev.preventDefault();
+      shellSend(keyMap[ev.key]);
+      return;
+    }
+    if (ev.key.length === 1 && !ev.metaKey) {
+      ev.preventDefault();
+      shellSend(ev.key);
+    }
+  });
+  $('term').addEventListener('paste', function (ev) {
+    var text = (ev.clipboardData || window.clipboardData).getData('text');
+    if (text) {
+      ev.preventDefault();
+      shellSend(text.replace(/\r?\n/g, '\r'));
+    }
+  });
+  $('term').addEventListener('focus', function () {
+    $('term').className = 'term focus';
+  });
+  $('term').addEventListener('blur', function () {
+    $('term').className = 'term';
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('#tab-shell [data-key]'),
+    function (b) {
+      b.addEventListener('click', function () {
+        var map = { C: '\x03', Z: '\x1a', D: '\x04', L: '\x0c' };
+        var key = map[b.getAttribute('data-key')] || '';
+        if (key) shellSend(key);
+        $('term').focus();
+      });
+    });
+  $('shform').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var value = $('shin').value;
+    if (!value) return;
+    $('shin').value = '';
+    shellSend(value + '\r');
+  });
+  $('shellstart').addEventListener('click', function () {
+    termReset();
+    post('/api/shell/start', { rows: 34, cols: 120 }).then(function (r) {
+      if (r && r.ok) {
+        toast('Shell opening on the active session…');
+        setTimeout(function () { $('term').focus(); }, 600);
+      } else {
+        toast((r && (r.message || r.error)) || 'could not start the shell', 'bad');
+      }
+    });
+  });
+  $('shellstop').addEventListener('click', function () {
+    post('/api/shell/stop', {});
+  });
+
+  // ---------- console tab: a real prompt inside the page --------------------
+  var CON = { buf: '', hist: [], pos: -1, stash: '' };
+  try {
+    CON.hist = JSON.parse(localStorage.getItem('cmon_console_hist') || '[]');
+  } catch (err) { CON.hist = []; }
+
+  function conScroll() {
+    var el = $('conterm');
+    el.scrollTop = el.scrollHeight;
+  }
+  function conSaveHist() {
+    try {
+      localStorage.setItem('cmon_console_hist', JSON.stringify(CON.hist));
+    } catch (err) {}
+  }
+  function conLine(text, isPrompt) {
+    // One committed line; command echoes get the colored prompt.
+    var term = $('conterm');
+    var div = document.createElement('div');
+    div.className = 'conline';
+    if (isPrompt) {
+      var b = document.createElement('span');
+      b.className = 'psym';
+      b.textContent = 'controller>';
+      div.appendChild(b);
+      div.appendChild(document.createTextNode(' ' + text));
+    } else {
+      div.textContent = text;
+    }
+    term.insertBefore(div, $('coninrow'));
+    while (term.childNodes.length > 3000) term.removeChild(term.firstChild);
+    conScroll();
+  }
+  function conRender() {
+    $('conintext').textContent = CON.buf;
+    conScroll();
+  }
+  function conSubmit() {
+    var line = CON.buf;
+    CON.buf = '';
+    CON.pos = -1;
+    CON.stash = '';
+    conLine(line, true);
+    conRender();
+    if (!line.trim()) return;
+    CON.hist.push(line);
+    if (CON.hist.length > 200) CON.hist.shift();
+    CON.pos = -1;
+    conSaveHist();
+    post('/api/cmd', { line: line }).then(function (r) {
+      if (r && r.error) conLine(r.error);
+    });
+  }
+  function conHistory(dir) {
+    if (!CON.hist.length) return;
+    if (CON.pos === -1 && dir < 0) {
+      CON.stash = CON.buf;
+      CON.pos = CON.hist.length;
+    }
+    CON.pos += dir;
+    if (CON.pos < 0) CON.pos = 0;
+    if (CON.pos >= CON.hist.length) {
+      CON.pos = -1;
+      CON.buf = CON.stash;
+    } else {
+      CON.buf = CON.hist[CON.pos];
+    }
+    conRender();
+  }
+  function conComplete() {
+    var line = CON.buf;
+    if (!line.trim()) return;
+    var matches = CON.hist.filter(function (h) {
+      return h !== line && h.indexOf(line) === 0;
+    });
+    if (matches.length === 1) {
+      CON.buf = matches[0];
+      conRender();
+    } else if (matches.length > 1) {
+      conLine(line, true);
+      matches.slice(-8).forEach(function (m) { conLine(m); });
+    }
+  }
+  function conClear() {
+    var term = $('conterm');
+    while (term.childNodes.length > 1) term.removeChild(term.firstChild);
+  }
+  // The live prompt row is created once, always the last line.
+  (function () {
+    var row = document.createElement('div');
+    row.className = 'conline';
+    row.id = 'coninrow';
+    var b = document.createElement('span');
+    b.className = 'psym';
+    b.textContent = 'controller>';
+    var t = document.createElement('span');
+    t.id = 'conintext';
+    var c = document.createElement('span');
+    c.className = 'caret';
+    row.appendChild(b);
+    row.appendChild(document.createTextNode(' '));
+    row.appendChild(t);
+    row.appendChild(c);
+    $('conterm').appendChild(row);
+  })();
+  $('conterm').addEventListener('mousedown', function (ev) {
+    if (ev.target.closest && ev.target.closest('a,button')) return;
+    // Let the caret land: focus after the default selection handling.
+    setTimeout(function () { $('conterm').focus(); }, 0);
+  });
+  $('conterm').addEventListener('focus', function () {
+    $('conterm').className = 'term focus';
+  });
+  $('conterm').addEventListener('blur', function () {
+    $('conterm').className = 'term';
+  });
+  $('conterm').addEventListener('paste', function (ev) {
+    var text = (ev.clipboardData || window.clipboardData).getData('text');
+    if (text) {
+      ev.preventDefault();
+      CON.buf += text.replace(/[\r\n]+/, ' ').trim();
+      conRender();
+    }
+  });
+  $('conterm').addEventListener('keydown', function (ev) {
+    if (ev.ctrlKey && !ev.altKey && (ev.key === 'l' || ev.key === 'L')) {
+      ev.preventDefault(); conClear(); return;
+    }
+    if (ev.ctrlKey && !ev.altKey && (ev.key === 'c' || ev.key === 'C')) {
+      ev.preventDefault();
+      conLine(CON.buf + '^C', true);
+      CON.buf = ''; CON.pos = -1; CON.stash = '';
+      conRender(); return;
+    }
+    if (ev.ctrlKey || ev.metaKey || ev.altKey) return;  // browser shortcuts
+    if (ev.key === 'Enter') { ev.preventDefault(); conSubmit(); return; }
+    if (ev.key === 'Backspace') {
+      ev.preventDefault();
+      CON.buf = CON.buf.slice(0, -1); conRender(); return;
+    }
+    if (ev.key === 'ArrowUp') { ev.preventDefault(); conHistory(-1); return; }
+    if (ev.key === 'ArrowDown') { ev.preventDefault(); conHistory(1); return; }
+    if (ev.key === 'Escape') {
+      ev.preventDefault(); CON.buf = ''; conRender(); return;
+    }
+    if (ev.key === 'Tab') { ev.preventDefault(); conComplete(); return; }
+    if (ev.key === 'Home') { /* left for a future day */ return; }
+    if (ev.key.length === 1) {
+      ev.preventDefault();
+      CON.buf += ev.key;
+      conRender();
+    }
+  });
+  $('conclear').addEventListener('click', conClear);
+  Array.prototype.forEach.call(document.querySelectorAll('[data-cmd]'),
+    function (b) {
+      b.addEventListener('click', function () {
+        CON.buf = b.getAttribute('data-cmd');
+        switchTab('console');
+        conSubmit();
+        $('conterm').focus();
+      });
+    });
+
+  // ---------- tabs ----------------------------------------------------------
+  function switchTab(name) {
+    S.tab = name;
+    ['shell', 'files', 'console'].forEach(function (tab) {
+      $('tabbtn-' + tab).className = (tab === name) ? 'on' : '';
+      $('tab-' + tab).hidden = (tab !== name);
+    });
+    if (name === 'files' && !$('filebody').dataset.loaded) {
+      $('filebody').dataset.loaded = '1';
+      loadFiles('~');
+    }
+    if (name === 'shell') $('term').focus();
+    if (name === 'console') $('conterm').focus();
+  }
+  ['shell', 'files', 'console'].forEach(function (tab) {
+    $('tabbtn-' + tab).addEventListener('click', function () { switchTab(tab); });
+  });
+
+  // ---------- live events ---------------------------------------------------
+  var es = new EventSource('/api/events' + qs);
+  es.addEventListener('log', function (e) {
+    try {
+      var d = JSON.parse(e.data);
+      (d.lines || []).forEach(function (line) { conLine(line); });
+    } catch (err) {}
+  });
+  es.addEventListener('shell_out', function (e) {
+    try { termWrite(JSON.parse(e.data).data); } catch (err) {}
+  });
+  es.addEventListener('shot', function () { refreshSoon(); });
+  es.addEventListener('open_screen', function () {
+    window.open('/screen' + qs, 'cmonscreen');
+  });
+  es.addEventListener('state', function (e) {
+    try { renderState(JSON.parse(e.data)); } catch (err) {}
+  });
+  es.onerror = function () {
+    $('livedot').className = 'dot';
+    $('livetxt').textContent = 'reconnecting…';
+  };
+  // Fallback poll in case a proxy blocks EventSource.
+  setInterval(function () {
+    fetch('/api/state' + qs, { headers: { 'X-Gui-Token': token } })
+      .then(function (r) { return r.json(); })
+      .then(renderState)
+      .catch(function () {});
+  }, 3000);
+
+  // ---------- initial fill --------------------------------------------------
+  fetch('/api/log' + qs, { headers: { 'X-Gui-Token': token } })
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      (d.lines || []).forEach(function (line) { conLine(line); });
+    })
+    .catch(function () {});
+  fetch('/api/state' + qs, { headers: { 'X-Gui-Token': token } })
+    .then(function (r) { return r.json(); })
+    .then(renderState)
+    .catch(function () {});
+})();
+</script>
+</body>
+</html>
+"""
+
+_GUI_SCREEN_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CMon — Live screen</title>
+<style>
+:root { color-scheme: dark; }
+body { margin: 0; background: #070b10; color: #d7dde5; height: 100vh;
+  display: flex; flex-direction: column;
+  font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+header { display: flex; gap: 10px; align-items: center; padding: 8px 14px;
+  background: #10161d; border-bottom: 1px solid #1d2733; }
+.brand { font-weight: 700; color: #58d5a9; }
+.pill { font-size: 11.5px; padding: 2px 9px; border-radius: 20px;
+  background: #1d2733; color: #8fa1b3; }
+.pill.on { background: #17402f; color: #58d5a9; }
+button { background: #17402f; color: #58d5a9; border: 1px solid #2e6e54;
+  padding: 6px 12px; border-radius: 7px; cursor: pointer; font: inherit; }
+button.red { background: #402226; border-color: #7d3a44; color: #ff8f9a; }
+.spacer { flex: 1; }
+#stage { flex: 1; display: flex; align-items: center; justify-content: center;
+  overflow: hidden; padding: 10px; }
+#stream { max-width: 100%; max-height: 100%; border-radius: 6px;
+  border: 1px solid #1d2733; background: #0d1117; }
+#wait { color: #667484; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">CMon <small>live screen</small></div>
+  <span class="pill" id="state">connecting…</span>
+  <span class="spacer"></span>
+  <button id="start">Start share</button>
+  <button id="stop" class="red">Stop share</button>
+</header>
+<div id="stage">
+  <img id="stream" alt="">
+  <div id="wait">Waiting for the stream — if nothing appears, press
+    <b>Start share</b> (or start it from the main dashboard).</div>
+</div>
+<script>
+(function () {
+  'use strict';
+  var token = new URLSearchParams(location.search).get('token') || '';
+  var qs = token ? ('?token=' + encodeURIComponent(token)) : '';
+  var alive = false;
+  function post(path) {
+    return fetch(path + qs, {
+      method: 'POST', headers: { 'X-Gui-Token': token },
+      body: '{}'
+    }).then(function (r) { return r.json(); })
+      .catch(function () { return {}; });
+  }
+  function setState(text, on) {
+    var pill = document.getElementById('state');
+    pill.textContent = text;
+    pill.className = 'pill' + (on ? ' on' : '');
+  }
+  function listen() {
+    var img = document.getElementById('stream');
+    img.src = '/api/screen/stream' + qs;
+    img.onload = function () { alive = true; setState('live', true); };
+    img.onerror = function () {
+      alive = false;
+      setState('not streaming', false);
+      setTimeout(listen, 2500);
+    };
+  }
+  document.getElementById('start').addEventListener('click', function () {
+    post('/api/screen/start').then(function (r) {
+      // A share that is already running is not an error for this page: just
+      // re-attach to the live stream (the button also recovers a share the
+      // terminal 'screenshare' command started).
+      if (r && r.ok) setState('starting…', false);
+      else setState((r && r.error) || 'could not start', false);
+      setTimeout(listen, 800);
+    });
+  });
+  document.getElementById('stop').addEventListener('click', function () {
+    post('/api/screen/stop').then(function () { setState('stopping…', false); });
+  });
+  setState('connecting…', false);
+  listen();
+})();
+</script>
+</body>
+</html>
+"""
+
+
+
+def start_gui_dashboard(host=None, port=None, token=None):
+    """Bring up the browser dashboard.  It never blocks the controller: any
+    failure here is reported and the controller keeps running normally."""
+    global GUI_STATE
+    GUI_SETTINGS['host'] = host or GUI_SETTINGS['host'] or '127.0.0.1'
+    try:
+        GUI_SETTINGS['port'] = int(port or GUI_SETTINGS['port'] or 8080)
+    except (TypeError, ValueError):
+        GUI_SETTINGS['port'] = 8080
+    GUI_SETTINGS['token'] = str(token or '')
+    GUI_STATE = GuiDashboard()
+    # The browser console's prompt thread: runs dashboard commands the
+    # moment they arrive, even while the terminal prompt waits for a key.
+    threading.Thread(target=_gui_command_dispatcher, name='gui-dispatcher',
+                     daemon=True).start()
+    try:
+        sys.stdout = _GuiTee(sys.stdout, GUI_STATE)
+    except Exception:
+        pass                            # the terminal must never depend on the GUI
+
+    def run():
+        candidate = GUI_SETTINGS['port']
+        server = None
+        for _attempt in range(20):
+            try:
+                server = _GuiServer((GUI_SETTINGS['host'], candidate),
+                                    _GuiRequestHandler)
+                break
+            except OSError:
+                candidate += 1
+        if server is None:
+            print('[!] Web GUI: no free port in {}-{}; the dashboard stays '
+                  'off and the terminal works as usual.'.format(
+                      GUI_SETTINGS['port'], candidate))
+            return
+        GUI_SETTINGS['port'] = candidate
+        shown_host = 'localhost' if GUI_SETTINGS['host'] in ('127.0.0.1',
+                                                             '0.0.0.0',
+                                                             '::') \
+            else GUI_SETTINGS['host']
+        print('[+] Web GUI ready:  http://{}:{}   (open it in any browser; '
+              'the terminal keeps working here)'.format(shown_host, candidate))
+        if GUI_SETTINGS['host'] not in ('127.0.0.1', 'localhost', '::1'):
+            print('[!] Web GUI is bound to {} - everyone who can reach '
+                  'that address can see this dashboard{}.'.format(
+                    GUI_SETTINGS['host'],
+                    ' (token required)' if GUI_SETTINGS['token'] else
+                    ' and drive the sessions (no token set: --gui-token)'))
+        try:
+            server.serve_forever(poll_interval=0.5)
+        except Exception:
+            pass
+        print('[!] Web GUI stopped.')
+
+    threading.Thread(target=run, name='gui-dashboard', daemon=True).start()
+    if (os.environ.get('CMON_GUI_OPEN') == '1'
+            or ((sys.platform == 'darwin' or os.name == 'nt')
+                and sys.stdout.isatty())):
+        try:
+            import webbrowser
+            url = 'http://{}:{}'.format(
+                'localhost' if GUI_SETTINGS['host'] in ('127.0.0.1', '0.0.0.0',
+                                                        '::')
+                else GUI_SETTINGS['host'], GUI_SETTINGS['port'])
+            threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+        except Exception:
+            pass
+
+
 def repl():
     """The prompt. It survives sessions coming and going; with no client it
     waits, watching stdin so 'exit' works and typed commands are queued."""
@@ -6887,12 +10661,50 @@ def _print_connect_hint(port):
         print("    Linux: open TCP {} in ufw/firewalld.".format(port))
 
 
+def _ensure_sigint_default():
+    """Ctrl+C (and the browser GUI's 'exit') must raise KeyboardInterrupt.
+
+Started as a shell background job, via nohup or from some launchers, the
+process inherits SIGINT as 'ignored' - and Python then never installs its
+KeyboardInterrupt handler, so Ctrl+C and the GUI exit silently do nothing.
+Restoring the standard handler keeps the normal, clean leave path."""
+    try:
+        if signal.getsignal(signal.SIGINT) in (signal.SIG_IGN, None):
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+    except (AttributeError, OSError, ValueError, RuntimeError):
+        pass
+
+
 def main():
     _harden_console()
+    _ensure_sigint_default()
     if CONNECTION_TYPE not in VALID_CONNECTION_TYPES:
         print("[!] Unknown connection_type {!r}. Use auto, tcp, http or https."
               .format(CONNECTION_TYPE))
         return
+    # Web dashboard (browser view of this controller).  Off only with
+    # --no-gui; everything else stays exactly as it has always been.
+    gui_enabled = '--no-gui' not in sys.argv[1:]
+
+    def _gui_flag(name, cast=None):
+        args = sys.argv[1:]
+        if name in args:
+            index = args.index(name)
+            if index + 1 < len(args):
+                value = args[index + 1]
+                try:
+                    return value if cast is None else cast(value)
+                except (TypeError, ValueError):
+                    print("[!] {} needs a valid value; using the default."
+                          .format(name))
+        return None
+
+    if gui_enabled:
+        start_gui_dashboard(
+            host=_gui_flag('--gui-host', str),
+            port=_gui_flag('--gui-port', int),
+            token=_gui_flag('--gui-token', str))
+
     if sys.platform == 'ios':
         try:
             import termios  # noqa: F401
