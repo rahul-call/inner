@@ -344,6 +344,24 @@ public static class Platform
     public static string ShellExecutable()
     {
         if (IsAndroid()) return Which("sh") is { Length: > 0 } sh ? sh : "/system/bin/sh";
+        if (IsIos())
+        {
+            // iOS only offers /bin/sh on jailbroken devices; a-Shell and iSH
+            // ship their own shells under /bin.
+            foreach (var candidate in new[] { "/bin/sh", "/bin/bash", "/bin/zsh" })
+                if (File.Exists(candidate)) return candidate;
+            return Which("sh") is { Length: > 0 } iosSh ? iosSh : "/bin/sh";
+        }
+        if (IsMacOs())
+        {
+            // A client started from the Finder, a LaunchAgent or a plain
+            // launchctl job has no SHELL - fall through to the ordered chain
+            // instead of landing on the ancient /bin/bash macOS ships.
+            var shell = Environment.GetEnvironmentVariable("SHELL");
+            foreach (var candidate in new[] { shell, "/bin/zsh", "/bin/bash", "/bin/sh" })
+                if (!string.IsNullOrEmpty(candidate) && File.Exists(candidate)) return candidate;
+            return Which("sh") is { Length: > 0 } macSh ? macSh : "/bin/sh";
+        }
         return "";
     }
 
@@ -5374,15 +5392,37 @@ public static class Shell
         var script = Platform.Which("script");
         if (!string.IsNullOrEmpty(script))
         {
-            ShellUnixWithScript(conn, script, command);
-            return;
+            // Every script(1) dialect spells "run this command" differently,
+            // and the differences are exactly why macOS used to fall into a
+            // dead shell channel.  The no-command form comes first because it
+            // is the only one shared by BSD (macOS), GNU and most other
+            // script(1) implementations: script -q /dev/null simply starts an
+            // interactive $SHELL inside a real PTY and relays raw bytes, so
+            // the terminal is sized by feeding one stty line to that shell
+            // afterwards.  The two argument forms stay as follow-ups for
+            // systems where the no-command form is not supported.
+            var attempts = new (string[] Args, string? FeedStty)[]
+            {
+                (new[] { "-q", "/dev/null" }, $"stty rows {rows} cols {cols}\n"),
+                (new[] { "-q", "/dev/null", "/bin/sh", "-c", command }, null),
+                (new[] { "-q", "-e", "-f", "-c", command, "/dev/null" }, null),
+            };
+            foreach (var (args, feedStty) in attempts)
+            {
+                if (ShellUnixWithScript(conn, script, args, feedStty)) return;
+                SendOutputText(conn,
+                    "\r\n[client] this script(1) form is not usable, trying the next one\r\n");
+            }
+            SendOutputText(conn,
+                "\r\n[client] no usable script(1) here; running a line-oriented shell\r\n");
         }
         // No script(1): start a shell on ordinary pipes. This keeps commands
         // and interactive programs usable, but cannot provide job control.
         ShellUnixPipes(conn, shell);
     }
 
-    private static void ShellUnixWithScript(Conn conn, string script, string command)
+    private static bool ShellUnixWithScript(Conn conn, string script,
+        string[] args, string? feedStty)
     {
         var psi = new ProcessStartInfo
         {
@@ -5393,17 +5433,8 @@ public static class Shell
             UseShellExecute = false,
             CreateNoWindow = true
         };
-        if (Platform.IsDarwin)
-        {
-            // macOS script(1) has a different command-line shape.
-            foreach (var arg in new[] { "-q", "/dev/null", "/bin/sh", "-c", command })
-                psi.ArgumentList.Add(arg);
-        }
-        else
-        {
-            foreach (var arg in new[] { "-q", "-e", "-f", "-c", command, "/dev/null" })
-                psi.ArgumentList.Add(arg);
-        }
+        foreach (var arg in args)
+            psi.ArgumentList.Add(arg);
         psi.Environment["TERM"] = "dumb";
         psi.Environment.Remove("COLORTERM");
         psi.Environment["PYTHONUNBUFFERED"] = "1";
@@ -5411,9 +5442,33 @@ public static class Shell
             psi.Environment["PYTHONIOENCODING"] = "utf-8";
 
         using var proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
-        if (!proc.Start()) throw new IOException("cannot start " + script);
         try
         {
+            try
+            {
+                if (!proc.Start()) return false;
+            }
+            catch
+            {
+                return false;          // exists but cannot exec: next form
+            }
+            // A very fast failure (an unsupported flag set, an old busybox
+            // script without -e, ...) means this dialect is not usable:
+            // report it and let the caller try the next form instead of
+            // leaving a dead channel.
+            if (proc.WaitForExit(250)) return false;
+            if (feedStty != null)
+            {
+                // No-command form: size the PTY from inside by letting the
+                // freshly started interactive shell run one stty line first.
+                try
+                {
+                    var stty = Encoding.ASCII.GetBytes(feedStty);
+                    proc.StandardInput.BaseStream.Write(stty, 0, stty.Length);
+                    proc.StandardInput.BaseStream.Flush();
+                }
+                catch { }
+            }
             var stdout = proc.StandardOutput.BaseStream;
             var stderr = proc.StandardError.BaseStream;
             var reader = new Thread(() =>
@@ -5492,6 +5547,7 @@ public static class Shell
             reader.Join(1000);
             try { proc.Kill(true); } catch { }
             try { proc.WaitForExit(500); } catch { }
+            return true;
         }
         finally
         {
@@ -5503,6 +5559,19 @@ public static class Shell
             try { proc.WaitForExit(500); } catch { }
         }
     }
+
+    // Own session -> Ctrl+C can hit the shell's group without ever touching
+    // the client itself, exactly like the Python client's pipe bridge.
+    private static class LibC
+    {
+        [DllImport("libc", SetLastError = true)]
+        public static extern int setpgid(int pid, int pgid);
+
+        [DllImport("libc", SetLastError = true)]
+        public static extern int kill(int pid, int sig);
+    }
+
+    private const int UnixSigint = 2;
 
     private static void ShellUnixPipes(Conn conn, string shell)
     {
@@ -5520,7 +5589,23 @@ public static class Shell
         psi.Environment.Remove("COLORTERM");
         psi.Environment["PYTHONUNBUFFERED"] = "1";
         using var proc = new Process { StartInfo = psi };
-        if (!proc.Start()) throw new IOException("cannot start " + shell);
+        try
+        {
+            proc.Start();
+        }
+        catch (Exception ex)
+        {
+            // Without this notice the shell channel just sat there empty.
+            SendOutputText(conn, $"\r\n[client] could not start {shell}: {ex.Message}\r\n");
+            return;
+        }
+        // Own process group: a later Ctrl+C signals the shell (and its
+        // foreground command) only, never this client.  The parent may
+        // setpgid() the child as long as both are still in the same session.
+        if (!Platform.IsWindows)
+        {
+            try { LibC.setpgid(proc.Id, proc.Id); } catch { }
+        }
         try
         {
             var reader = new Thread(() =>
@@ -5548,28 +5633,100 @@ public static class Shell
                 catch { }
             }) { IsBackground = true, Name = "pipe-shell-stderr" };
             errorDrain.Start();
-            var input = new BoundedInputWriter(data =>
+
+            // The controller's terminal is raw, so Enter arrives as a bare
+            // '\r'.  A shell reading from a *pipe* (not a terminal) does not
+            // strip '\r' - it would try to execute "cmd\r" and answer
+            // "command not found: ^M".  Every submitted line is therefore
+            // echoed locally and forwarded with a single trailing '\n' and
+            // no '\r'.
+            var stdin = proc.StandardInput.BaseStream;
+            var line = new List<byte>(256);
+            var lastWasCr = false;
+            bool PipeWrite(byte[] data)
             {
                 try
                 {
-                    proc.StandardInput.BaseStream.Write(data, 0, data.Length);
-                    proc.StandardInput.BaseStream.Flush();
+                    stdin.Write(data, 0, data.Length);
+                    stdin.Flush();
                     return true;
                 }
                 catch { return false; }
-            });
+            }
             var buffer = new byte[65536];
-            while (true)
+            var dead = false;
+            while (!dead)
             {
                 if (proc.HasExited && !reader.IsAlive) break;
                 var n = conn.Read(buffer, 0, buffer.Length, 200);
-                if (n < 0) { if (input.Failed) break; continue; }
+                if (n < 0) continue;
                 if (n == 0) break;
-                var copy = new byte[n];
-                Buffer.BlockCopy(buffer, 0, copy, 0, n);
-                input.Send(copy);
+                for (var i = 0; i < n && !dead; i++)
+                {
+                    var value = buffer[i];
+                    if (value == 0x0d || value == 0x0a)
+                    {
+                        if (value == 0x0a && lastWasCr)
+                        {
+                            lastWasCr = false;          // CRLF counts as one Enter
+                            continue;
+                        }
+                        lastWasCr = value == 0x0d;
+                        if (!SendOutputText(conn, "\r\n")) { dead = true; break; }
+                        var submitted = new byte[line.Count + 1];
+                        line.CopyTo(submitted);
+                        submitted[line.Count] = 0x0a;
+                        if (!PipeWrite(submitted)) { dead = true; break; }
+                        line.Clear();
+                        continue;
+                    }
+                    lastWasCr = false;
+                    if (value == 0x7f || value == 0x08)
+                    {
+                        if (line.Count > 0)
+                        {
+                            line.RemoveAt(line.Count - 1);
+                            if (!SendOutputText(conn, "\b \b")) { dead = true; break; }
+                        }
+                        continue;
+                    }
+                    if (value == 0x03)                  // Ctrl+C
+                    {
+                        line.Clear();
+                        if (!SendOutputText(conn, "^C\r\n")) { dead = true; break; }
+                        var signaled = false;
+                        if (!Platform.IsWindows)
+                        {
+                            try { signaled = LibC.kill(-proc.Id, UnixSigint) == 0; }
+                            catch { signaled = false; }
+                        }
+                        // 0x03 written to a pipe is just a byte, not an
+                        // interrupt; keep it as the last resort.
+                        if (!signaled && !PipeWrite(new byte[] { 0x03 })) { dead = true; break; }
+                        continue;
+                    }
+                    if (value == 0x04)                  // Ctrl+D
+                    {
+                        if (line.Count > 0)
+                        {
+                            var submitted = new byte[line.Count + 1];
+                            line.CopyTo(submitted);
+                            submitted[line.Count] = 0x0a;
+                            if (!SendOutputText(conn, "\r\n")) { dead = true; break; }
+                            if (!PipeWrite(submitted)) { dead = true; break; }
+                            line.Clear();
+                        }
+                        else
+                        {
+                            try { stdin.Close(); } catch { }
+                        }
+                        continue;
+                    }
+                    if (value < 0x20 && value != 0x09) continue;   // other control bytes
+                    line.Add(value);
+                    if (!SendOutput(conn, new[] { value }, 1)) { dead = true; break; }
+                }
             }
-            input.Close();
             try { proc.StandardInput.Close(); } catch { }
             try { proc.Kill(true); } catch { }
             try { proc.WaitForExit(500); } catch { }
@@ -5593,8 +5750,15 @@ public static class Shell
         catch { return false; }
     }
 
-    private static void SendOutputText(Conn conn, string text)
-        => Protocol.SendShellOutput(conn, Encoding.UTF8.GetBytes(text));
+    private static bool SendOutputText(Conn conn, string text)
+    {
+        try
+        {
+            Protocol.SendShellOutput(conn, Encoding.UTF8.GetBytes(text));
+            return true;
+        }
+        catch { return false; }
+    }
 
     // ---------------------------------------------------------------------
     // Windows ConPTY
@@ -5659,7 +5823,11 @@ public static class Shell
             if (!Win32Kernel.InitializeProcThreadAttributeList(attrBuf, 1, 0, ref needed))
                 throw new IOException("InitializeProcThreadAttributeList: " + Win32Kernel.LastError());
             stage = "UpdateProcThreadAttribute";
-            if (!Win32Kernel.UpdateProcThreadAttribute(attrBuf, 0, (IntPtr)0x00020016, hpc,
+            // lpValue must point AT the pseudoconsole handle, so it is
+            // ref hPC; passing the handle value itself made the attribute
+            // call corrupt memory / fail and quietly pushed every Windows
+            // shell into the pipe fallback.
+            if (!Win32Kernel.UpdateProcThreadAttribute(attrBuf, 0, (IntPtr)0x00020016, ref hpc,
                     (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero))
                 throw new IOException("UpdateProcThreadAttribute: " + Win32Kernel.LastError());
 
@@ -6296,7 +6464,7 @@ public static class Shell
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool UpdateProcThreadAttribute(IntPtr list, uint flags,
-            IntPtr attribute, IntPtr value, IntPtr size, IntPtr previous, IntPtr returned);
+            IntPtr attribute, ref IntPtr value, IntPtr size, IntPtr previous, IntPtr returned);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern void DeleteProcThreadAttributeList(IntPtr list);

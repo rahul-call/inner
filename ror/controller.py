@@ -6820,13 +6820,90 @@ def _gui_term_text(text):
     understands: \\x01 = EL (cut the line at the cursor), \\x02 = ED (clear
     the screen).  \\r, \\b and \\t survive verbatim - they are what makes
     echo, backspace and column-aligned output behave like a real terminal
-    instead of one div per network chunk."""
+    instead of one div per network chunk.
+
+    This one-shot form is only safe for text that never splits an escape
+    sequence.  Shell output arrives as network chunks and Windows ConPTY
+    emits a dense stream of short escapes that straddle chunk boundaries
+    constantly, so GuiShell feeds its chunks through _gui_term_feed()."""
     if '\x1b' in text:
         for el in ('\x1b[0K', '\x1b[K'):
             text = text.replace(el, '\x01')
         for ed in ('\x1b[0J', '\x1b[J', '\x1b[1J', '\x1b[2J'):
             text = text.replace(ed, '\x02')
     return _gui_ansi_strip(text).replace('\x00', '')
+
+
+# Complete CSI sequences the browser terminal model understands as sentinels.
+_GUI_EL_SEQS = ('\x1b[K', '\x1b[0K')
+_GUI_ED_SEQS = ('\x1b[J', '\x1b[0J', '\x1b[1J', '\x1b[2J')
+_GUI_MAX_PEND = 512          # a malformed sequence may never wedge the stream
+
+
+def _gui_term_feed(state, text):
+    """Chunk-boundary-safe _gui_term_text().
+
+    state is a dict owned by one shell session and carries a partial escape
+    sequence from the previous chunk.  ConPTY (Windows) writes its frame as
+    many tiny writes, so a CSI or OSC is regularly split across two recv()
+    chunks; a per-chunk stripper turned the fragments into visible garbage
+    ('[3J', '[H', the window title text...) and an unterminated OSC swallowed
+    the rest of its chunk - the Windows browser shell showed nothing useful.
+    Complete sequences are sanitized exactly like _gui_term_text() does."""
+    text = state.pop('pend', '') + text
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch != '\x1b':
+            out.append(ch)
+            i += 1
+            continue
+        j = i + 1
+        if j >= n:                      # bare ESC: its tail is in the next chunk
+            state['pend'] = '\x1b'
+            break
+        nxt = text[j]
+        if nxt == '[':                  # CSI ... final byte in @..~
+            k = j + 1
+            while k < n and not ('@' <= text[k] <= '~'):
+                k += 1
+            if k >= n:
+                state['pend'] = text[i:]
+                break
+            seq = text[i:k + 1]
+            if seq in _GUI_EL_SEQS:
+                out.append('\x01')
+            elif seq in _GUI_ED_SEQS:
+                out.append('\x02')
+            i = k + 1
+            continue
+        if nxt == ']':                  # OSC ... BEL or ESC \
+            k = j + 1
+            while k < n:
+                c = text[k]
+                if c == '\x07':
+                    k += 1
+                    break
+                if c == '\x1b':
+                    if k + 1 < n and text[k + 1] == '\\':
+                        k += 2
+                    break               # ST, or an abandoned OSC: reprocess ESC
+                k += 1
+            else:
+                state['pend'] = text[i:]    # still open at the end of the chunk
+                break
+            i = k
+            continue
+        i = j + 1                       # two-byte escape (ESC 7, ESC c, ...)
+    pend = state.get('pend')
+    if pend and len(pend) > _GUI_MAX_PEND:
+        # A sequence that never finished is malformed: drop it instead of
+        # holding the terminal's output back forever.
+        state['pend'] = ''
+        out.insert(0, _gui_ansi_strip(pend))
+    return ''.join(out).replace('\x00', '')
 
 
 def _gui_ansi_strip(text):
@@ -6879,6 +6956,7 @@ class GuiShell(object):
         self.client_os = ''
         self.out = []
         self._pend = b''                # a UTF-8 character split mid-chunk
+        self._esc = {}                  # an escape sequence split mid-chunk
         self.version = 1
 
     def snapshot(self):
@@ -6921,7 +6999,7 @@ class GuiShell(object):
                     data = data[start + 1:]
             if not text:
                 continue
-            text = _gui_term_text(text)
+            text = _gui_term_feed(self._esc, text)
             if not text:
                 continue
             with self.lock:
@@ -6949,12 +7027,14 @@ class GuiShell(object):
             self.client_os = client_os or ''
             self.out = []
             self._pend = b''
+            self._esc = {}
             self.version += 1
 
     def detach(self):
         with self.lock:
             self.conn = None
             self._pend = b''
+            self._esc = {}
             self.version += 1
 
     def stop(self):

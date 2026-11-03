@@ -3221,14 +3221,14 @@ def _shell_pipe_dead(proc):
 
 def _shell_unix(sock, rows, cols):
     """Bridge a real interactive shell (PTY) to the controller's socket."""
-    import fcntl
-    import pty
-    import signal
-    import termios
-
     try:
+        import fcntl
+        import pty
+        import signal
+        import termios
+
         pid, master_fd = pty.fork()
-    except (ImportError, AttributeError, NotImplementedError, OSError) as exc:
+    except Exception as exc:
         # iOS and locked-down sandboxes have no usable PTY.  Degrade to the
         # line-oriented bridge instead of killing the whole shell session
         # (the old code let the error escape and 'shell' just died there).
@@ -3912,8 +3912,14 @@ def _shell_windows_conpty(sock, rows, cols):
             if not data:
                 break
             writer.send(data)
-    except Exception:
-        pass
+    except Exception as exc:
+        # A silent death here left the controller's shell connected but empty
+        # ("shows nothing"); report it through the shell channel instead.
+        try:
+            _shell_notice(sock, 'ConPTY bridge stopped unexpectedly: {}'.format(
+                str(exc) or exc.__class__.__name__))
+        except Exception:
+            pass
     finally:
         stop.set()
         try:
@@ -4129,12 +4135,17 @@ def _shell_windows_pipes(sock):
         startupinfo.dwFlags |= getattr(subprocess, 'STARTF_USESHOWWINDOW', 1)
         startupinfo.wShowWindow = getattr(subprocess, 'SW_HIDE', 0)
         creationflags = 0x00000010          # CREATE_NEW_CONSOLE
-    proc = subprocess.Popen([shell], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, bufsize=0,
-                            close_fds=True,          # never inherit socket handles
-                            startupinfo=startupinfo,
-                            creationflags=creationflags,
-                            env=_shell_child_env())
+    try:
+        proc = subprocess.Popen([shell], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, bufsize=0,
+                                close_fds=True,          # never inherit socket handles
+                                startupinfo=startupinfo,
+                                creationflags=creationflags,
+                                env=_shell_child_env())
+    except OSError as exc:
+        # Without this notice the shell channel just sat there empty.
+        _shell_notice(sock, 'could not start {}: {}'.format(shell, exc))
+        return
 
     send_lock = threading.Lock()
 
