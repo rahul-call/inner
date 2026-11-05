@@ -37,7 +37,7 @@ const cp = require('child_process');
 // ================================================================
 // Paths (BaseDir / StateFile may be re-pointed by hideInstallDir)
 // ================================================================
-let BaseDir = normPath(expandUser('~/.configs'));
+let BaseDir = normPath(expandUser('~/.config'));
 let StateFile = path.join(BaseDir, 'state.json');
 
 const LinuxAutostartDir = expandUser('~/.config/autostart');
