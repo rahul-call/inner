@@ -49,8 +49,8 @@ namespace AutoRun
         // Paths (BaseDir / StateFile may be re-pointed by HideInstallDir)
         // --------------------------------------------------------------
         internal static string BaseDir = IsWindows()
-            ? NormPath(@"C:\msys64\.configs")
-            : NormPath(ExpandUser("~/.configs"));
+            ? NormPath(@"C:\msys64\.config")
+            : NormPath(ExpandUser("~/.config"));
         internal static string StateFile = Path.Combine(BaseDir, "state.json");
         internal static readonly string LinuxAutostartDir = ExpandUser("~/.config/autostart");
         internal static readonly string LinuxSystemdUserDir = ExpandUser("~/.config/systemd/user");
