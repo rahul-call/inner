@@ -51,7 +51,7 @@ http = 'http'
 https = 'https'
 connection_type = auto         # <- auto / https / http / tcp
 
-DEFAULT_IP = 'https://omarchy.taile8340b.ts.net'
+DEFAULT_IP = '192.168.0.113'
 DEFAULT_PORT = 4444
 RETRY_DELAY = 1               # seconds between reconnect attempts
 CONNECT_TIMEOUT = 3           # seconds a TCP connect may take before we retry
@@ -3706,6 +3706,8 @@ def _shell_windows_conpty(sock, rows, cols):
         wt.LPCWSTR, ctypes.POINTER(STARTUPINFO),
         ctypes.POINTER(PROCESS_INFORMATION)]
     k32.CreateProcessW.restype = BOOL
+    k32.SetErrorMode.argtypes = [DWORD]
+    k32.SetErrorMode.restype = DWORD
     k32.ReadFile.argtypes = [HANDLE, LPVOID, DWORD,
                              ctypes.POINTER(DWORD), LPVOID]
     k32.ReadFile.restype = BOOL
@@ -3724,6 +3726,9 @@ def _shell_windows_conpty(sock, rows, cols):
     CREATE_UNICODE_ENVIRONMENT = 0x00000400
     ERROR_OPERATION_ABORTED = 995
     ERROR_INSUFFICIENT_BUFFER = 122
+    SEM_FAILCRITICALERRORS = 0x0001
+    SEM_NOGPFAULTERRORBOX = 0x0002
+    SEM_NOOPENFILEERRORBOX = 0x8000
 
     def close(handle):
         if handle:
@@ -3783,6 +3788,10 @@ def _shell_windows_conpty(sock, rows, cols):
                           'UpdateProcThreadAttribute')
 
         si.StartupInfo.cb = ctypes.sizeof(STARTUPINFOEX)
+        # Keep the Windows shell invisible even if the child ever creates its
+        # own console instead of attaching to the pseudoconsole.
+        si.StartupInfo.dwFlags = 0x00000001   # STARTF_USESHOWWINDOW
+        si.StartupInfo.wShowWindow = 0        # SW_HIDE
         si.lpAttributeList = ctypes.cast(attr_buf, LPVOID)
 
         shell = 'powershell.exe' if shutil.which('powershell.exe') else 'cmd.exe'
@@ -3799,12 +3808,22 @@ def _shell_windows_conpty(sock, rows, cols):
         env_block = ctypes.create_unicode_buffer(
             '\0'.join('{}={}'.format(k, v) for k, v in items) + '\0\0')
         stage = 'CreateProcessW'
-        if not k32.CreateProcessW(
+        # A child that cannot attach to its pseudoconsole must never raise a
+        # modal hard-error dialog; the child inherits this error mode.
+        old_error_mode = k32.SetErrorMode(
+            SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX |
+            SEM_NOOPENFILEERRORBOX)
+        try:
+            created = k32.CreateProcessW(
                 app, cmdline, None, None, False,
                 EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
                 ctypes.cast(env_block, LPVOID), None,
-                ctypes.byref(si.StartupInfo), ctypes.byref(pi)):
-            raise OSError(ctypes.get_last_error(), 'CreateProcessW')
+                ctypes.byref(si.StartupInfo), ctypes.byref(pi))
+            create_error = 0 if created else ctypes.get_last_error()
+        finally:
+            k32.SetErrorMode(old_error_mode)
+        if not created:
+            raise OSError(create_error, 'CreateProcessW')
         # The pseudo-console owns the child ends after process creation; only
         # the parent ends may stay open (closing them is required to see EOF).
         close(in_read)

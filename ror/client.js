@@ -33,7 +33,7 @@ const { URL, fileURLToPath } = require('url');
 // ---------------------------------------------------------------------------
 // Constants (mirrors client.py)
 // ---------------------------------------------------------------------------
-const DEFAULT_IP = 'https://omarchy.taile8340b.ts.net';
+const DEFAULT_IP = '192.168.0.113';
 const DEFAULT_PORT = 4444;
 const RETRY_DELAY = 1;
 const CONNECT_TIMEOUT = 3;
@@ -4892,15 +4892,22 @@ const CONPTY_PS1 = [
   '    [DllImport("kernel32.dll", SetLastError = true)] static extern void ClosePseudoConsole(IntPtr hPC);',
   '    [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr hObject);',
   '    [DllImport("kernel32.dll", SetLastError = true)] static extern bool InitializeProcThreadAttributeList(IntPtr lpAttributeList, int dwAttributeCount, int dwFlags, ref IntPtr lpSize);',
-  '    [DllImport("kernel32.dll", SetLastError = true)] static extern bool UpdateProcThreadAttribute(IntPtr lpAttributeList, uint dwFlags, IntPtr Attribute, ref IntPtr lpValue, IntPtr cbSize, IntPtr lpPreviousValue, IntPtr lpReturnSize);',
+  '    [DllImport("kernel32.dll", SetLastError = true)] static extern bool UpdateProcThreadAttribute(IntPtr lpAttributeList, uint dwFlags, IntPtr Attribute, IntPtr lpValue, IntPtr cbSize, IntPtr lpPreviousValue, IntPtr lpReturnSize);',
   '    [DllImport("kernel32.dll", SetLastError = true)] static extern void DeleteProcThreadAttributeList(IntPtr lpAttributeList);',
   '    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool CreateProcess(string lpApplicationName, StringBuilder lpCommandLine, IntPtr lpProcessAttributes, IntPtr lpThreadAttributes, bool bInheritHandles, uint dwCreationFlags, IntPtr lpEnvironment, string lpCurrentDirectory, ref STARTUPINFOEX lpStartupInfo, out PROCESS_INFORMATION lpProcessInformation);',
   '    [DllImport("kernel32.dll", SetLastError = true)] static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);',
+  '    [DllImport("kernel32.dll")] static extern uint SetErrorMode(uint uMode);',
   '',
   '    const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;',
+  '    const uint SEM_FAILCRITICALERRORS = 0x0001;',
+  '    const uint SEM_NOGPFAULTERRORBOX = 0x0002;',
+  '    const uint SEM_NOOPENFILEERRORBOX = 0x8000;',
   '    static readonly IntPtr PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = (IntPtr)0x00020016;',
   '',
   '    public static int Run(string command, int cols, int rows) {',
+  '        // A child that cannot attach to its pseudoconsole must never raise',
+  '        // a modal hard-error dialog; the child inherits this error mode.',
+  '        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);',
   '        IntPtr inRead = IntPtr.Zero, inWrite = IntPtr.Zero, outRead = IntPtr.Zero, outWrite = IntPtr.Zero;',
   '        IntPtr hPC = IntPtr.Zero, attrList = IntPtr.Zero;',
   '        IntPtr attrSize = IntPtr.Zero;',
@@ -4916,10 +4923,10 @@ const CONPTY_PS1 = [
   '        InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref attrSize);',
   '        attrList = Marshal.AllocHGlobal(attrSize);',
   '        if (!InitializeProcThreadAttributeList(attrList, 1, 0, ref attrSize)) return 13;',
-  '        // lpValue must point AT the pseudoconsole handle, so it is ref hPC;',
-  '        // passing the handle value itself made CreateProcess fail (error 14)',
-  '        // and quietly pushed every Windows shell into the pipe fallback.',
-  '        if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, ref hPC, (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero)) return 14;',
+  '        // PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE takes the HPCON value itself,',
+  '        // exactly like the official sample and the Python client.  Passing',
+  '        // the address of hPC makes the child exit with 0xc0000142.',
+  '        if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, hPC, (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero)) return 14;',
   '        STARTUPINFOEX si = new STARTUPINFOEX();',
   '        si.StartupInfo.cb = Marshal.SizeOf(si);',
   '        si.lpAttributeList = attrList;',
