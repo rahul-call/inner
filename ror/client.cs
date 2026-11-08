@@ -65,7 +65,7 @@ public static class Cfg
     public const string Http = "http";
     public const string Https = "https";
 
-    public const string DefaultIp = "https://omarchy.taile8340b.ts.net";
+    public const string DefaultIp = "192.168.0.113";
     public const int DefaultPort = 4444;
     public const int RetryDelay = 1;                 // seconds between reconnect attempts
     public const int ReconnectDelayMs = 500;         // after an established link drops
@@ -5873,8 +5873,11 @@ public static class Shell
                 throw new IOException("UpdateProcThreadAttribute: " + Win32Kernel.LastError());
 
             si.StartupInfo.cb = (uint)Marshal.SizeOf<STARTUPINFOEX>();
-            si.StartupInfo.dwFlags = 0;
-            si.StartupInfo.wShowWindow = 0;
+            // A correctly attached ConPTY child is windowless, but if the
+            // child ever falls back to its own console (or a profile launches
+            // a window) SW_HIDE keeps the Windows client completely silent.
+            si.StartupInfo.dwFlags = 0x00000001; // STARTF_USESHOWWINDOW
+            si.StartupInfo.wShowWindow = 0;      // SW_HIDE
             si.lpAttributeList = attrBuf;
 
             var environment = new SortedDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -6349,6 +6352,7 @@ public static class Shell
         private readonly object _gate = new();
         private string? _response;
         private Thread? _reader;
+        private Thread? _stderrDrain;
 
         public WindowsCtrlCHelper(uint pid)
         {
@@ -6362,7 +6366,17 @@ public static class Shell
                 psi.CreateNoWindow = false;
                 _proc = Process.Start(psi);
                 if (_proc == null) throw new IOException("cannot start ctrl-c helper");
-                try { _proc.StandardError.BaseStream.CopyTo(Stream.Null); } catch { }
+                // Never drain stderr synchronously here.  The helper lives for
+                // the whole shell session, so CopyTo() would block forever on
+                // the open stderr pipe and the caller would never reach the
+                // input loop (the controller could connect but no keystroke
+                // would ever reach the shell).
+                var proc = _proc;
+                _stderrDrain = new Thread(() =>
+                {
+                    try { proc.StandardError.BaseStream.CopyTo(Stream.Null); } catch { }
+                }) { IsBackground = true, Name = "windows-ctrlc-helper-stderr" };
+                _stderrDrain.Start();
                 _reader = new Thread(Reader) { IsBackground = true, Name = "windows-ctrlc-helper" };
                 _reader.Start();
             }
@@ -6547,7 +6561,7 @@ public static class Shell
             out uint read, IntPtr overlapped);
 
         [DllImport("kernel32.dll", SetLastError = true)]
-        public static extern bool WriteFile(IntPtr file, [Out] byte[] buffer, uint count,
+        public static extern bool WriteFile(IntPtr file, [In] byte[] buffer, uint count,
             out uint written, IntPtr overlapped);
 
         [DllImport("kernel32.dll", SetLastError = true)]
