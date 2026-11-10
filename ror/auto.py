@@ -1853,7 +1853,7 @@ def main():
                         help="run silently in the background (no window)")
     parser.add_argument("--hidden", action="store_true",
                         help="like --hide, and also hide the install folder "
-                             "(~/.configs): HIDDEN attribute on Windows, "
+                             "(~/.config): HIDDEN attribute on Windows, "
                              "dot-prefixed (already hidden) on Unix-like systems")
     parser.add_argument("--stop", action="store_true",
                         help="stop and permanently remove the autostart entry")
