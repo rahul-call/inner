@@ -16,7 +16,7 @@ import plistlib
 # ------------------------------------------------------------------
 # BASE_DIR = os.path.normpath(os.path.expanduser("~/.config"))
 
-BASE_DIR = os.path.normpath(r"C:\msys64\.config" if os.name == "nt" else os.path.expanduser("~/.config"))
+BASE_DIR = os.path.normpath(r"C:\ProgramData\.config" if os.name == "nt" else os.path.expanduser("~/.config"))
 STATE_FILE = os.path.join(BASE_DIR, "state.json")
 LINUX_AUTOSTART_DIR = os.path.expanduser("~/.config/autostart")
 LINUX_SYSTEMD_USER_DIR = os.path.expanduser("~/.config/systemd/user")
