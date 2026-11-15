@@ -8,16 +8,21 @@
  *
  * Requirements:
  *   macOS (Apple Silicon or Intel) and Node.js.
- *   No Electron and no npm install.  The page is shown by a browser that is
- *   already on the Mac: Chrome/Chromium in kiosk mode when installed,
- *   otherwise Safari.
+ *   No Electron and no npm install.  On macOS the script builds a small native
+ *   Swift/WebKit kiosk window on first run.  That needs the Xcode Command Line
+ *   Tools (install once with: xcode-select --install).  If Swift is not
+ *   available it falls back to Chrome/Chromium kiosk mode, then Safari.
  *
  * Run (the supported macOS command):
  *   node fake_ransom.js
  *
- * The script serves its own embedded page on a private 127.0.0.1 port and
- * opens it in the browser.  When the passphrase is accepted the page posts
- * back to the script, which closes the browser window again.
+ * The script builds its embedded page and shows it in the native WKWebView on
+ * every display.  When the passphrase is accepted the page tells the native
+ * window, which restores the desktop and exits.  The browser fallback serves
+ * the same page on a private 127.0.0.1 port.
+ *
+ * Force Quit (Cmd+Opt+Esc), Activity Monitor and the power button are kept
+ * available as emergency exits.
  *
  * By default the window shows the still scary wallpaper (no animation).
  * Add --animate to bring the flames and embers back.
@@ -138,8 +143,10 @@ if (HELP) {
   console.log([
     'Usage: node fake_ransom.js [options]',
     '',
-    'No Electron or npm install is needed.  Chrome/Chromium is used in',
-    'kiosk mode when it is installed; otherwise Safari is used.',
+    'No Electron or npm install is needed.  On macOS a native Swift/WebKit',
+    'kiosk window is built on first run when swiftc is available.  Install the',
+    'Xcode Command Line Tools once with:  xcode-select --install',
+    'Without them, Chrome/Chromium kiosk mode or Safari is used instead.',
     '',
     '  --windowed          run in a 1280x720 window instead of kiosk mode',
     '  --animate           enable the flame/ember animation',
@@ -160,17 +167,20 @@ if (HELP) {
 // No-Electron launcher
 // ---------------------------------------------------------------------------
 // Plain `node fake_ransom.js` is all that is needed on macOS.  Node cannot
-// open a window by itself, so this file serves its embedded page from a
-// private 127.0.0.1 HTTP server and shows it in a browser that is already on
-// the Mac.  Nothing has to be installed.
+// open a window by itself, so this file first tries a tiny native Swift/WebKit
+// host (native/fake_ransom_window.swift), which is compiled on first run.  The
+// native host restores the Electron-era lockdown: all displays, hidden Dock
+// and menu bar, blocked shortcuts, pinned cursor, refused window close.
 //
+// If swiftc is unavailable, or the build fails, the launcher falls back to:
 //   * Google Chrome / Chromium / Brave / Edge / Vivaldi: kiosk window.
 //   * Safari (always shipped with macOS): new window; the page switches it to
 //     fullscreen on the first keypress or click.
 //
-// The page POSTs /unlock after the passphrase is accepted; the server then
-// closes the browser window and exits.  `--selftest` and `--help` above exit
-// before this point, so they work without launching anything.
+// The native path writes the page to a temporary file and needs no server.
+// The browser path serves it on 127.0.0.1; the page POSTs /unlock after the
+// passphrase is accepted.  `--selftest` and `--help` above exit before this
+// point, so they work without launching anything.
 
 const http = require('http');
 const os = require('os');
@@ -187,6 +197,7 @@ let server = null;
 let pageHtml = '';
 let browserChild = null;
 let browserProfile = '';
+let nativePageDir = '';
 let safariUrl = '';
 let safariPoller = null;
 let safariPolling = false;
@@ -216,6 +227,13 @@ function buildBridge(allowFullscreen, allowWindowClose) {
     '  function unlock() {',
     '    if (unlocked) return;',
     '    unlocked = true;',
+    '    try {',
+    '      if (window.webkit && window.webkit.messageHandlers &&',
+    '          window.webkit.messageHandlers.fakeRansom) {',
+    '        window.webkit.messageHandlers.fakeRansom.postMessage("unlock");',
+    '        return;',
+    '      }',
+    '    } catch (err) {}',
     '    try {',
     '      fetch("/unlock", { method: "POST", keepalive: true }).catch(function () {});',
     '    } catch (err) {}'
@@ -258,17 +276,6 @@ function buildBridge(allowFullscreen, allowWindowClose) {
       '    } catch (err) {}',
       '  }',
       '',
-      '  function focusPage() {',
-      '    try {',
-      '      document.body.tabIndex = -1;',
-      '      document.body.focus();',
-      '      window.focus();',
-      '    } catch (err) {}',
-      '  }',
-      '  focusPage();',
-      '  setTimeout(focusPage, 0);',
-      '  window.addEventListener("mousedown", focusPage, true);',
-      '',
       '  window.addEventListener("keydown", goFullscreen, { capture: true, once: true });',
       '  window.addEventListener("mousedown", goFullscreen, { capture: true, once: true });',
       ''
@@ -276,6 +283,29 @@ function buildBridge(allowFullscreen, allowWindowClose) {
   }
 
   lines.push(
+    '  function focusPage() {',
+    '    try {',
+    '      document.body.tabIndex = -1;',
+    '      document.body.focus();',
+    '      window.focus();',
+    '    } catch (err) {}',
+    '  }',
+    '  focusPage();',
+    '  setTimeout(focusPage, 0);',
+    '  window.addEventListener("mousedown", focusPage, true);',
+    '',
+    '  window.__fakeRansomApplyKey = function (key) {',
+    '    try {',
+    '      var e = new KeyboardEvent("keydown", {',
+    '        key: key,',
+    '        bubbles: true,',
+    '        cancelable: true',
+    '      });',
+    '      e.__fromNative = true;',
+    '      window.dispatchEvent(e);',
+    '    } catch (err) {}',
+    '  };',
+    '',
     '  window.addEventListener("keydown", function (e) {',
     '    if (unlocked) return;',
     '    if (e.metaKey || e.ctrlKey || e.altKey) return;',
@@ -298,12 +328,36 @@ function buildBridge(allowFullscreen, allowWindowClose) {
     '    typed += e.key;',
     '  }, true);',
     '',
+    '  // Mirror real keystrokes to the other displays.  The native host calls',
+    '  // __fakeRansomApplyKey in every other WKWebView, which updates the',
+    '  // renderer there without bouncing the event back here.',
+    '  window.addEventListener("keydown", function (e) {',
+    '    if (unlocked || e.__fromNative || e.__fromScript) return;',
+    '    if (e.metaKey || e.ctrlKey || e.altKey) return;',
+    '    var key = e.key;',
+    '    if (key !== "Enter" && key !== "Backspace") {',
+    '      if (typeof key !== "string" || key.length !== 1) return;',
+    '      var cp = key.codePointAt(0);',
+    '      var isLetter = (cp >= 0x41 && cp <= 0x5a) || (cp >= 0x61 && cp <= 0x7a);',
+    '      var isDigit = cp >= 0x30 && cp <= 0x39;',
+    '      if (!isLetter && !isDigit) return;',
+    '    }',
+    '    try {',
+    '      if (window.webkit && window.webkit.messageHandlers &&',
+    '          window.webkit.messageHandlers.fakeRansom) {',
+    '        window.webkit.messageHandlers.fakeRansom.postMessage({ type: "key", key: key });',
+    '      }',
+    '    } catch (err) {}',
+    '  }, true);',
+    '',
     '  function press(key) {',
-    '    window.dispatchEvent(new KeyboardEvent("keydown", {',
+    '    var e = new KeyboardEvent("keydown", {',
     '      key: key,',
     '      bubbles: true,',
     '      cancelable: true',
-    '    }));',
+    '    });',
+    '    e.__fromScript = true;',
+    '    window.dispatchEvent(e);',
     '  }',
     '',
     '  function typeText(text) {',
@@ -466,10 +520,11 @@ function finish(code) {
     try { child.kill('SIGTERM'); } catch (err) {}
     setTimeout(function () {
       try { child.kill('SIGKILL'); } catch (err) {}
-    }, 1200).unref();
+    }, 1500).unref();
   }
 
   setTimeout(function () {
+    cleanupNativePage();
     if (browserProfile) {
       try {
         fs.rmSync(browserProfile, { recursive: true, force: true });
@@ -477,17 +532,20 @@ function finish(code) {
       browserProfile = '';
     }
     process.exit(typeof code === 'number' ? code : 0);
-  }, 1000);
+  }, 2000);
 }
 
 process.on('SIGINT', function () { finish(130); });
 process.on('SIGTERM', function () { finish(143); });
 process.on('SIGHUP', function () { finish(129); });
 
-// If Node exits for any other reason, never leave a kiosk browser behind.
+// If Node exits for any other reason, never leave a kiosk window behind.
+// SIGTERM closes the native host/browser; macOS releases the native host's
+// windows and presentation options when the process exits.  The SIGKILL
+// fallback inside finish() handles a hung child.
 process.on('exit', function () {
   if (browserChild) {
-    try { browserChild.kill('SIGKILL'); } catch (err) {}
+    try { browserChild.kill('SIGTERM'); } catch (err) {}
   }
 });
 
@@ -546,9 +604,19 @@ function launchChromium(browser, url) {
   }
 
   let started = false;
-  browserChild = spawn(browser.binary, args, { stdio: 'ignore' });
+  let child;
+  try {
+    child = spawn(browser.binary, args, { stdio: 'ignore' });
+  } catch (err) {
+    console.error(
+      'fake_ransom.js: could not start ' + browser.name + ': ' + err.message
+    );
+    launchSafari(url);
+    return;
+  }
+  browserChild = child;
 
-  browserChild.on('spawn', function () {
+  child.on('spawn', function () {
     started = true;
     console.log(
       'fake_ransom.js: showing the lock screen in ' + browser.name +
@@ -556,8 +624,8 @@ function launchChromium(browser, url) {
     );
   });
 
-  browserChild.on('error', function (err) {
-    browserChild = null;
+  child.on('error', function (err) {
+    if (browserChild === child) browserChild = null;
     if (started) return;
     console.error(
       'fake_ransom.js: could not start ' + browser.name + ': ' + err.message
@@ -565,7 +633,10 @@ function launchChromium(browser, url) {
     launchSafari(url);
   });
 
-  browserChild.on('exit', function () {
+  child.on('exit', function () {
+    // A spawn error may already have started the Safari fallback.  Ignore a
+    // late exit from the browser that never really started.
+    if (browserChild !== child) return;
     browserChild = null;
     if (finishing || !started) return;
     console.log('fake_ransom.js: browser closed');
@@ -716,10 +787,229 @@ function takeScreenshot(browser, url) {
 }
 
 // ---------------------------------------------------------------------------
-// Start
+// Native macOS kiosk host
 // ---------------------------------------------------------------------------
 
-function main() {
+const NATIVE_SOURCE = path.join(__dirname, 'native', 'fake_ransom_window.swift');
+const NATIVE_BUILD_DIR = path.join(__dirname, 'native', '.build');
+const NATIVE_BINARY = path.join(NATIVE_BUILD_DIR, 'fake_ransom_window');
+
+function cleanupNativePage() {
+  if (!nativePageDir) return;
+  try {
+    fs.rmSync(nativePageDir, { recursive: true, force: true });
+  } catch (err) {}
+  nativePageDir = '';
+}
+
+function findSwiftc() {
+  // The standard Command Line Tools and Xcode locations cover almost every
+  // Mac.  Checking them first avoids making xcrun pop the install dialog.
+  const candidates = [
+    '/Library/Developer/CommandLineTools/usr/bin/swiftc',
+    '/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc'
+  ];
+  for (const candidate of candidates) {
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch (err) {}
+  }
+
+  // A non-standard Xcode selected with xcode-select -s.
+  const found = spawnSync('xcrun', ['--find', 'swiftc'], {
+    encoding: 'utf8',
+    timeout: 10000
+  });
+  if (!found.error && found.status === 0) {
+    const binary = String(found.stdout || '').trim();
+    if (binary && fs.existsSync(binary)) return binary;
+  }
+
+  return null;
+}
+
+function findOrBuildNativeWrapper() {
+  if (process.platform !== 'darwin') return null;
+
+  if (!fs.existsSync(NATIVE_SOURCE)) {
+    console.error(
+      'fake_ransom.js: native/fake_ransom_window.swift is missing; ' +
+      'using the browser fallback.'
+    );
+    return null;
+  }
+
+  let needsBuild = true;
+  if (fs.existsSync(NATIVE_BINARY)) {
+    try {
+      fs.accessSync(NATIVE_BINARY, fs.constants.X_OK);
+      needsBuild = fs.statSync(NATIVE_BINARY).mtimeMs <
+        fs.statSync(NATIVE_SOURCE).mtimeMs;
+    } catch (err) {
+      needsBuild = true;
+    }
+  }
+  if (!needsBuild) return NATIVE_BINARY;
+
+  const swiftc = findSwiftc();
+  if (!swiftc) {
+    console.error(
+      'fake_ransom.js: native lockdown needs the Xcode Command Line Tools.\n' +
+      'Install them once with:  xcode-select --install\n' +
+      'Falling back to the browser launcher (weaker lockdown).'
+    );
+    return null;
+  }
+
+  try {
+    fs.mkdirSync(NATIVE_BUILD_DIR, { recursive: true });
+    // Never leave a stale/partial binary from an earlier failed build.
+    fs.rmSync(NATIVE_BINARY, { force: true });
+  } catch (err) {
+    console.error(
+      'fake_ransom.js: could not prepare ' + NATIVE_BUILD_DIR + ': ' + err.message
+    );
+    return null;
+  }
+
+  console.log('fake_ransom.js: building the native kiosk window (first run only)...');
+  let build;
+  try {
+    build = spawnSync(swiftc, [
+      NATIVE_SOURCE,
+      '-swift-version', '5',
+      '-O',
+      '-parse-as-library',
+      '-o', NATIVE_BINARY,
+      '-framework', 'Cocoa',
+      '-framework', 'WebKit'
+    ], { stdio: 'inherit', timeout: 120000 });
+  } catch (err) {
+    console.error('fake_ransom.js: native build failed: ' + err.message);
+    return null;
+  }
+
+  if (build.error || build.status !== 0) {
+    try { fs.rmSync(NATIVE_BINARY, { force: true }); } catch (err) {}
+    console.error(
+      'fake_ransom.js: native kiosk build failed' +
+      (build.status !== 0 ? ' (swiftc exited with ' + build.status + ')' : '') +
+      '; falling back to the browser.'
+    );
+    return null;
+  }
+
+  try {
+    fs.accessSync(NATIVE_BINARY, fs.constants.X_OK);
+  } catch (err) {
+    console.error(
+      'fake_ransom.js: swiftc did not produce an executable; ' +
+      'falling back to the browser.'
+    );
+    return null;
+  }
+
+  return NATIVE_BINARY;
+}
+
+function startDuration() {
+  if (DURATION <= 0 || finishing || durationTimer) return;
+  durationTimer = setTimeout(function () {
+    console.log('fake_ransom.js: duration reached');
+    finish(0);
+  }, DURATION * 1000);
+}
+
+function launchNative(binary, page) {
+  try {
+    nativePageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fake_ransom_page_'));
+    const pageFile = path.join(nativePageDir, 'page.html');
+    fs.writeFileSync(pageFile, page, 'utf8');
+
+    const args = ['--html', pageFile];
+    if (WINDOWED) args.push('--windowed');
+
+    let started = false;
+    const launchedAt = Date.now();
+    let child;
+    try {
+      child = spawn(binary, args, { stdio: ['ignore', 'inherit', 'inherit'] });
+    } catch (err) {
+      console.error(
+        'fake_ransom.js: could not start the native window: ' + err.message
+      );
+      cleanupNativePage();
+      startBrowser();
+      return;
+    }
+    browserChild = child;
+
+    child.on('spawn', function () {
+      started = true;
+      console.log(
+        'fake_ransom.js: showing the lock screen in the native macOS window' +
+        (WINDOWED ? ' (windowed)' : ' (all displays)')
+      );
+    });
+
+    child.on('error', function (err) {
+      if (browserChild === child) browserChild = null;
+      if (started) return;
+      console.error(
+        'fake_ransom.js: could not start the native window: ' + err.message
+      );
+      cleanupNativePage();
+      startBrowser();
+    });
+
+    child.on('exit', function (code, signal) {
+      if (browserChild !== child) return;
+      browserChild = null;
+      if (finishing) return;
+
+      // A native build that launches but fails immediately should not leave
+      // the user with no prank at all.  Unlock/duration exits are 0 and are
+      // handled normally.  A real crash (SIGSEGV, SIGABRT, ...) falls back;
+      // SIGTERM/SIGKILL/SIGINT mean the user or Node closed it on purpose.
+      const intentionalSignal = signal === 'SIGTERM' ||
+        signal === 'SIGKILL' || signal === 'SIGINT';
+      const failedEarly = started && Date.now() - launchedAt < 4000 &&
+        ((code !== null && code !== 0) ||
+         (code === null && signal && !intentionalSignal));
+
+      if (failedEarly) {
+        console.error(
+          'fake_ransom.js: native window exited early (' +
+          (code === null ? signal : 'status ' + code) +
+          '); falling back to the browser.'
+        );
+        cleanupNativePage();
+        if (durationTimer) {
+          clearTimeout(durationTimer);
+          durationTimer = null;
+        }
+        startBrowser();
+        return;
+      }
+
+      console.log('fake_ransom.js: window closed');
+      finish(typeof code === 'number' ? code : 0);
+    });
+
+    startDuration();
+  } catch (err) {
+    console.error(
+      'fake_ransom.js: could not prepare the native page: ' + err.message
+    );
+    cleanupNativePage();
+    startBrowser();
+  }
+}
+
+// The browser fallback (and the normal path on non-macOS hosts).  The native
+// path above does not start the HTTP server at all.
+function startBrowser() {
   const browser = findChromium();
   const allowFullscreen = !WINDOWED && !browser;
 
@@ -746,14 +1036,7 @@ function main() {
       launchSafari(url);
     }
 
-    if (finishing) return;
-
-    if (DURATION > 0) {
-      durationTimer = setTimeout(function () {
-        console.log('fake_ransom.js: duration reached');
-        finish(0);
-      }, DURATION * 1000);
-    }
+    startDuration();
   }).catch(function (err) {
     console.error(
       'fake_ransom.js: failed to start:',
@@ -761,6 +1044,39 @@ function main() {
     );
     finish(1);
   });
+}
+
+// ---------------------------------------------------------------------------
+// Start
+// ---------------------------------------------------------------------------
+
+function main() {
+  // On macOS, prefer the native host: it can cover every display, hide the
+  // Dock/menu bar, block shortcuts and pin the cursor.  Screenshot mode still
+  // uses headless Chrome because it needs a command-line page capture.
+  if (!SCREENSHOT && process.platform === 'darwin') {
+    let nativeBinary = null;
+    try {
+      nativeBinary = findOrBuildNativeWrapper();
+    } catch (err) {
+      console.error('fake_ransom.js: native setup failed: ' + err.message);
+    }
+
+    if (nativeBinary) {
+      let page;
+      try {
+        page = buildPage(false, false);
+      } catch (err) {
+        console.error('fake_ransom.js: failed to build its page:', err.message);
+        finish(1);
+        return;
+      }
+      launchNative(nativeBinary, page);
+      return;
+    }
+  }
+
+  startBrowser();
 }
 
 main();
