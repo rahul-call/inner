@@ -1,20 +1,23 @@
 #!/usr/bin/env node
 /*
- * fake_ransom.js - macOS Electron port of fake_ransom.cs
+ * fake_ransom.js - macOS fake ransomware lock screen
  *
  * A fake ransomware lock screen.  Nothing is encrypted, deleted, or sent
  * anywhere.  The only way out is the passphrase below, Force Quit, or killing
  * the process from a terminal.
  *
  * Requirements:
- *   macOS (Apple Silicon or Intel) and Electron.
+ *   macOS (Apple Silicon or Intel) and Node.js.
+ *   No Electron and no npm install.  The page is shown by a browser that is
+ *   already on the Mac: Chrome/Chromium in kiosk mode when installed,
+ *   otherwise Safari.
  *
  * Run (the supported macOS command):
- *   npm install electron
  *   node fake_ransom.js
  *
- * The script finds Electron in node_modules (or on PATH) and re-launches
- * itself under it automatically, so `node fake_ransom.js` is all you need.
+ * The script serves its own embedded page on a private 127.0.0.1 port and
+ * opens it in the browser.  When the passphrase is accepted the page posts
+ * back to the script, which closes the browser window again.
  *
  * By default the window shows the still scary wallpaper (no animation).
  * Add --animate to bring the flames and embers back.
@@ -135,13 +138,16 @@ if (HELP) {
   console.log([
     'Usage: node fake_ransom.js [options]',
     '',
+    'No Electron or npm install is needed.  Chrome/Chromium is used in',
+    'kiosk mode when it is installed; otherwise Safari is used.',
+    '',
     '  --windowed          run in a 1280x720 window instead of kiosk mode',
     '  --animate           enable the flame/ember animation',
     '                      (default is the still scary wallpaper)',
     '  --duration N        exit after N seconds (testing)',
     '  --autotype TEXT     type TEXT and press Enter after 1 second (testing)',
     '  --typed TEXT        pre-fill the password field (testing)',
-    '  --screenshot PATH   save a PNG and exit (testing)',
+    '  --screenshot PATH   save a PNG and exit (needs Chrome/Chromium)',
     '  --selftest          test the password logic without opening a window',
     '  --help              show this help',
     '',
@@ -151,450 +157,610 @@ if (HELP) {
 }
 
 // ---------------------------------------------------------------------------
-// Plain-Node launcher
+// No-Electron launcher
 // ---------------------------------------------------------------------------
-// The supported macOS command is `node fake_ransom.js`.  Plain Node cannot
-// open a window, so find the Electron runtime and re-run this exact file under
-// it.  When the file is already inside Electron this block is skipped.
-// `--selftest` and `--help` above exit before this point, so they still work
-// with plain Node and no Electron installed.
+// Plain `node fake_ransom.js` is all that is needed on macOS.  Node cannot
+// open a window by itself, so this file serves its embedded page from a
+// private 127.0.0.1 HTTP server and shows it in a browser that is already on
+// the Mac.  Nothing has to be installed.
+//
+//   * Google Chrome / Chromium / Brave / Edge / Vivaldi: kiosk window.
+//   * Safari (always shipped with macOS): new window; the page switches it to
+//     fullscreen on the first keypress or click.
+//
+// The page POSTs /unlock after the passphrase is accepted; the server then
+// closes the browser window and exits.  `--selftest` and `--help` above exit
+// before this point, so they work without launching anything.
 
-if (!process.versions.electron) {
-  const { spawnSync } = require('child_process');
-  let command = null;
+const http = require('http');
+const os = require('os');
+const path = require('path');
+const { spawn, spawnSync, execFile } = require('child_process');
 
-  // The normal case: `npm install electron` left a path in node_modules.
-  try {
-    const resolved = require('electron');
-    if (typeof resolved === 'string' && fs.existsSync(resolved)) {
-      command = resolved;
-    }
-  } catch (err) {
-    command = null;
-  }
-
-  // Fallback: a global install exposes an `electron` command on PATH.
-  if (!command) {
-    const probe = spawnSync('electron', ['--version'], { stdio: 'ignore' });
-    if (!probe.error && probe.status === 0) command = 'electron';
-  }
-
-  // Last resort on macOS: a manually installed Electron.app.
-  if (!command && process.platform === 'darwin') {
-    const appBinary = '/Applications/Electron.app/Contents/MacOS/Electron';
-    if (fs.existsSync(appBinary)) command = appBinary;
-  }
-
-  if (!command) {
-    console.error(
-      'fake_ransom.js needs Electron to open its window.\n' +
-      '\n' +
-      '  Install it once, in this folder:\n' +
-      '    npm install electron\n' +
-      '\n' +
-      '  Then run:\n' +
-      '    node fake_ransom.js\n'
-    );
-    process.exit(1);
-  }
-
-  const result = spawnSync(
-    command,
-    [__filename].concat(process.argv.slice(2)),
-    { stdio: 'inherit' }
-  );
-  if (result.error) {
-    console.error('fake_ransom.js could not start Electron:', result.error.message);
-    process.exit(1);
-  }
-  process.exit(result.status === null ? 1 : result.status);
-}
-
-const { app, BrowserWindow, Menu, globalShortcut, ipcMain, screen } = require('electron');
-
-// ---------------------------------------------------------------------------
-// Window lifecycle
-// ---------------------------------------------------------------------------
-
-const IS_MAC = process.platform === 'darwin';
-// Every window shares one wall-clock scene start, so the flames and embers on
-// a secondary monitor are at exactly the same frame as the primary one.
 const SCENE_START = Date.now();
-let mainWindow = null;
-let secondaryWindows = [];
-let allWindows = [];
-let allowClose = false;
-let finishing = false;
-let rendererReady = false;
+const PASSPHRASE = (function () {
+  const match = STATE_SOURCE.match(/PASSPHRASE\s*=\s*'([^']*)'/);
+  return match ? match[1] : 'bomboclat';
+})();
+
+let server = null;
+let pageHtml = '';
+let browserChild = null;
+let browserProfile = '';
+let safariUrl = '';
+let safariPoller = null;
+let safariPolling = false;
 let durationTimer = null;
 let screenshotTimer = null;
-let autotypeTimer = null;
-let lastState = { typed: TYPED || '', deniedUntil: 0, closing: false };
+let finishing = false;
 
-function registerMacShortcuts() {
-  if (!IS_MAC) return;
-  // Deliberately do NOT register Command+Alt+Esc: that is macOS Force Quit,
-  // which is the documented safety exit for this prank.  Swallowing it could
-  // leave someone with no way out except a terminal.
-  const shortcuts = [
-    'Command+Q',
-    'Command+W',
-    'Command+H',
-    'Command+M'
+// ---------------------------------------------------------------------------
+// Page served to the browser
+// ---------------------------------------------------------------------------
+
+// The rendered page is the embedded HTML with two tiny scripts added:
+//   * before the renderer, a `process.argv` shim so the renderer keeps its
+//     normal --static / --scene-start behaviour in a browser;
+//   * after the renderer, a bridge that mirrors the passphrase buffer and
+//     tells this process when the page has been unlocked.
+function buildBridge(allowFullscreen, allowWindowClose) {
+  const lines = [
+    '(function () {',
+    '  "use strict";',
+    '  var PASSPHRASE = (typeof globalThis !== "undefined" && globalThis.PASSPHRASE) || ' +
+      JSON.stringify(PASSPHRASE) + ';',
+    '  var MAX_INPUT_LENGTH = (typeof globalThis !== "undefined" && globalThis.MAX_INPUT_LENGTH) || 16;',
+    '  var typed = "";',
+    '  var unlocked = false;',
+    '',
+    '  function unlock() {',
+    '    if (unlocked) return;',
+    '    unlocked = true;',
+    '    try {',
+    '      fetch("/unlock", { method: "POST", keepalive: true }).catch(function () {});',
+    '    } catch (err) {}'
   ];
-  for (const shortcut of shortcuts) {
-    try {
-      globalShortcut.register(shortcut, () => {});
-    } catch (err) {
-      // Some macOS versions reserve a shortcut; ignore it.
-    }
-  }
-}
 
-function createWindows() {
-  const primaryDisplay = screen.getPrimaryDisplay();
-  const displays = WINDOWED
-    ? [primaryDisplay]
-    : [primaryDisplay].concat(
-        screen.getAllDisplays().filter(
-          (display) => display.id !== primaryDisplay.id
-        )
-      );
-
-  displays.forEach((display, index) => {
-    createPrankWindow(display, index === 0);
-  });
-}
-
-function createPrankWindow(display, isPrimary) {
-  const bounds = display.bounds;
-  const full = !WINDOWED;
-  const width = WINDOWED ? 1280 : bounds.width;
-  const height = WINDOWED ? 720 : bounds.height;
-
-  const win = new BrowserWindow({
-    width: width,
-    height: height,
-    x: WINDOWED ? Math.round(bounds.x + (bounds.width - width) / 2) : bounds.x,
-    y: WINDOWED ? Math.round(bounds.y + (bounds.height - height) / 2) : bounds.y,
-    frame: false,
-    show: false,
-    backgroundColor: '#0a0201',
-    fullscreen: full && !IS_MAC && isPrimary,
-    simpleFullscreen: false,
-    kiosk: false,
-    resizable: WINDOWED,
-    movable: WINDOWED,
-    minimizable: WINDOWED,
-    maximizable: WINDOWED,
-    closable: true,
-    fullscreenable: true,
-    skipTaskbar: full,
-    autoHideMenuBar: true,
-    hasShadow: false,
-    roundedCorners: false,
-    titleBarStyle: 'hidden',
-    // Display-only windows must never take keyboard focus.  On macOS this is
-    // enforced by the window server; showInactive() below covers the rest.
-    focusable: isPrimary,
-    webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false,
-      sandbox: false,
-      backgroundThrottling: false,
-      devTools: false,
-      spellcheck: false,
-      webSecurity: true,
-      additionalArguments: []
-        .concat(STATIC ? ['--static'] : [])
-        .concat(['--scene-start=' + SCENE_START])
-        .concat(isPrimary ? [] : ['--secondary'])
-    }
-  });
-
-  allWindows.push(win);
-  if (isPrimary) {
-    mainWindow = win;
-  } else {
-    secondaryWindows.push(win);
+  if (allowWindowClose) {
+    // A browser that lets a script close its own tab (Safari often does for a
+    // freshly opened page) gives us a clean exit even when Automation
+    // permission was denied and osascript cannot close the window.  Chrome
+    // normally refuses this, but the server kills the kiosk process anyway.
+    lines.push(
+      '    setTimeout(function () {',
+      '      try { window.close(); } catch (err) {}',
+      '    }, 250);'
+    );
   }
 
-  try { win.setMenuBarVisibility(false); } catch (err) {}
-  if (isPrimary) {
-    try { Menu.setApplicationMenu(null); } catch (err) {}
+  lines.push('  }', '');
+
+  if (allowFullscreen) {
+    // Safari does not let a page go fullscreen on load, but it does allow it
+    // from a user gesture.  The first keypress or click locks the window down.
+    lines.push(
+      '  function goFullscreen() {',
+      '    var el = document.documentElement;',
+      '    var pending = null;',
+      '    var allowKeyboard = (typeof Element !== "undefined" &&',
+      '      Element.ALLOW_KEYBOARD_INPUT) || 1;',
+      '    try {',
+      '      if (el.requestFullscreen) {',
+      '        pending = el.requestFullscreen();',
+      '      } else if (el.webkitRequestFullscreen) {',
+      '        pending = el.webkitRequestFullscreen(allowKeyboard);',
+      '      } else if (el.webkitRequestFullScreen) {',
+      '        pending = el.webkitRequestFullScreen(allowKeyboard);',
+      '      }',
+      '      if (pending && typeof pending.catch === "function") {',
+      '        pending.catch(function () {});',
+      '      }',
+      '    } catch (err) {}',
+      '  }',
+      '',
+      '  function focusPage() {',
+      '    try {',
+      '      document.body.tabIndex = -1;',
+      '      document.body.focus();',
+      '      window.focus();',
+      '    } catch (err) {}',
+      '  }',
+      '  focusPage();',
+      '  setTimeout(focusPage, 0);',
+      '  window.addEventListener("mousedown", focusPage, true);',
+      '',
+      '  window.addEventListener("keydown", goFullscreen, { capture: true, once: true });',
+      '  window.addEventListener("mousedown", goFullscreen, { capture: true, once: true });',
+      ''
+    );
   }
 
-  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-  win.webContents.on('will-navigate', (event) => event.preventDefault());
-
-  win.webContents.on('before-input-event', (event, input) => {
-    if (input.type !== 'keyDown') return;
-    if (!isPrimary) {
-      event.preventDefault();
-      return;
-    }
-    const key = String(input.key || '').toLowerCase();
-    // Block every Command/Ctrl chord.  Cmd+Tab is handled by macOS before
-    // the app sees it, but the kiosk window remains on top and focused.
-    if (input.meta || input.control) {
-      event.preventDefault();
-      return;
-    }
-    if (key === 'escape' || key === 'f11' || key === 'f12') {
-      event.preventDefault();
-    }
-  });
-
-  win.on('close', (event) => {
-    if (allowClose) return;
-    event.preventDefault();
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('close-denied');
-    }
-  });
-
-  win.on('closed', () => {
-    allWindows = allWindows.filter((item) => item !== win);
-    secondaryWindows = secondaryWindows.filter((item) => item !== win);
-    if (mainWindow === win) mainWindow = null;
-  });
-
-  if (!WINDOWED) {
-    if (isPrimary) {
-      win.on('blur', () => {
-        if (allowClose || !win || win.isDestroyed()) return;
-        setTimeout(() => {
-          if (!allowClose && win && !win.isDestroyed()) {
-            try { win.focus(); } catch (err) {}
-          }
-        }, 80);
-      });
-    }
-
-    win.on('minimize', () => {
-      if (!allowClose && win && !win.isDestroyed()) {
-        try { win.restore(); } catch (err) {}
-      }
-    });
-
-    win.on('hide', () => {
-      if (!allowClose && win && !win.isDestroyed()) {
-        try {
-          if (isPrimary) {
-            win.show();
-          } else {
-            win.showInactive();
-          }
-        } catch (err) {}
-      }
-    });
-
-    win.on('leave-full-screen', () => {
-      if (allowClose || !win || win.isDestroyed()) return;
-      try {
-        if (IS_MAC) {
-          win.setSimpleFullScreen(true);
-          if (isPrimary) win.setKiosk(true);
-        } else {
-          win.setFullScreen(true);
-        }
-      } catch (err) {}
-    });
-  }
-
-  win.once('ready-to-show', () => {
-    if (!win || win.isDestroyed()) return;
-    if (isPrimary) {
-      win.show();
-      win.focus();
-    } else {
-      win.showInactive();
-    }
-
-    if (!full) return;
-
-    if (IS_MAC) {
-      try { win.setSimpleFullScreen(true); } catch (err) {}
-      if (isPrimary) {
-        try { win.setKiosk(true); } catch (err) {}
-      }
-      try { win.setAlwaysOnTop(true, 'screen-saver'); } catch (err) {
-        try { win.setAlwaysOnTop(true); } catch (err2) {}
-      }
-      try {
-        win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-      } catch (err) {}
-      if (isPrimary) {
-        try { win.setWindowButtonVisibility(false); } catch (err) {}
-        try { app.dock.hide(); } catch (err) {}
-      }
-    } else {
-      try { win.setFullScreen(true); } catch (err) {}
-      try { win.setAlwaysOnTop(true); } catch (err) {}
-    }
-  });
-
-  win.loadURL(
-    'data:text/html;base64,' + Buffer.from(HTML, 'utf8').toString('base64')
-  ).catch((err) => {
-    console.error('fake_ransom.js could not load its window:', err);
-    if (isPrimary) {
-      allowClose = true;
-      app.quit();
-    } else {
-      try { win.destroy(); } catch (err2) {}
-    }
-  });
-}
-
-function finish() {
-  if (finishing) return;
-  finishing = true;
-  allowClose = true;
-  if (durationTimer) clearTimeout(durationTimer);
-  if (screenshotTimer) clearTimeout(screenshotTimer);
-  if (autotypeTimer) clearTimeout(autotypeTimer);
-  globalShortcut.unregisterAll();
-
-  for (const win of allWindows.slice()) {
-    if (!win || win.isDestroyed()) continue;
-    try { win.setKiosk(false); } catch (err) {}
-    try { win.setSimpleFullScreen(false); } catch (err) {}
-    try { win.setFullScreen(false); } catch (err) {}
-    try { win.setClosable(true); } catch (err) {}
-    try { win.close(); } catch (err) {}
-  }
-
-  setTimeout(() => {
-    try { app.quit(); } catch (err) {}
-  }, 60);
-}
-
-function takeScreenshot() {
-  if (!SCREENSHOT || !mainWindow || mainWindow.isDestroyed()) {
-    finish();
-    return;
-  }
-  mainWindow.webContents.capturePage().then((image) => {
-    try {
-      fs.writeFileSync(SCREENSHOT, image.toPNG());
-      console.log('screenshot saved: ' + SCREENSHOT);
-    } catch (err) {
-      console.error('could not save screenshot:', err);
-    }
-    finish();
-  }).catch((err) => {
-    console.error('could not capture screenshot:', err);
-    finish();
-  });
-}
-
-function senderWindow(event) {
-  try {
-    return BrowserWindow.fromWebContents(event.sender);
-  } catch (err) {
-    return null;
-  }
-}
-
-ipcMain.on('renderer-ready', (event) => {
-  const win = senderWindow(event);
-  if (!win) return;
-
-  // A secondary window only needs the current password/denial state.
-  if (win !== mainWindow) {
-    try { event.sender.send('state', lastState); } catch (err) {}
-    return;
-  }
-
-  if (rendererReady) return;
-  rendererReady = true;
+  lines.push(
+    '  window.addEventListener("keydown", function (e) {',
+    '    if (unlocked) return;',
+    '    if (e.metaKey || e.ctrlKey || e.altKey) return;',
+    '    if (e.key === "Enter") {',
+    '      var accepted = typed.trim().toLowerCase() === PASSPHRASE;',
+    '      typed = "";',
+    '      if (accepted) unlock();',
+    '      return;',
+    '    }',
+    '    if (e.key === "Backspace") {',
+    '      typed = typed.slice(0, -1);',
+    '      return;',
+    '    }',
+    '    if (typeof e.key !== "string" || e.key.length !== 1) return;',
+    '    var cp = e.key.codePointAt(0);',
+    '    var isLetter = (cp >= 0x41 && cp <= 0x5a) || (cp >= 0x61 && cp <= 0x7a);',
+    '    var isDigit = cp >= 0x30 && cp <= 0x39;',
+    '    if (!isLetter && !isDigit) return;',
+    '    if (typed.length >= MAX_INPUT_LENGTH) return;',
+    '    typed += e.key;',
+    '  }, true);',
+    '',
+    '  function press(key) {',
+    '    window.dispatchEvent(new KeyboardEvent("keydown", {',
+    '      key: key,',
+    '      bubbles: true,',
+    '      cancelable: true',
+    '    }));',
+    '  }',
+    '',
+    '  function typeText(text) {',
+    '    for (var i = 0; i < text.length; i++) {',
+    '      var ch = text.charAt(i);',
+    '      if (ch === "\\n" || ch === "\\r") {',
+    '        press("Enter");',
+    '      } else {',
+    '        press(ch);',
+    '      }',
+    '    }',
+    '  }',
+    ''
+  );
 
   if (TYPED) {
-    try { mainWindow.webContents.send('set-typed', TYPED); } catch (err) {}
+    lines.push(
+      '  setTimeout(function () { typeText(' + JSON.stringify(TYPED) + '); }, 150);'
+    );
   }
   if (AUTOTYPE) {
-    autotypeTimer = setTimeout(() => {
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('autotype', AUTOTYPE);
+    lines.push(
+      '  setTimeout(function () {',
+      '    typeText(' + JSON.stringify(AUTOTYPE) + ');',
+      '    press("Enter");',
+      '  }, 900);'
+    );
+  }
+
+  lines.push('})();');
+  return lines.join('\n');
+}
+
+function buildPage(allowFullscreen, allowWindowClose) {
+  const argv = ['node', 'fake_ransom.js', '--scene-start=' + SCENE_START];
+  if (STATIC) argv.push('--static');
+
+  const preamble = '<script>window.process = { argv: ' +
+    JSON.stringify(argv) + ' };</script>';
+  const bridge = '<script>\n' +
+    buildBridge(allowFullscreen, allowWindowClose) + '\n</script>';
+
+  const marker = '</script>\n<script>\n/* Renderer for fake_ransom.js.';
+  let page = HTML.replace(marker, function () {
+    return '</script>\n' + preamble +
+      '\n<script>\n/* Renderer for fake_ransom.js.';
+  });
+  if (page === HTML) {
+    throw new Error('could not find the renderer script in the embedded page');
+  }
+
+  page = page.replace('</body>', function () {
+    return bridge + '\n</body>';
+  });
+  return page;
+}
+
+// ---------------------------------------------------------------------------
+// Local server and shutdown
+// ---------------------------------------------------------------------------
+
+function startServer() {
+  return new Promise(function (resolve, reject) {
+    server = http.createServer(function (req, res) {
+      const url = req.url || '/';
+
+      if (url === '/' || url.indexOf('/?') === 0) {
+        res.writeHead(200, {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'Content-Length': Buffer.byteLength(pageHtml)
+        });
+        res.end(pageHtml);
+        return;
       }
-    }, 700);
+
+      if (url === '/unlock') {
+        res.writeHead(204, {
+          'Cache-Control': 'no-store',
+          'Connection': 'close'
+        });
+        res.end();
+        console.log('fake_ransom.js: passphrase accepted');
+        // In screenshot mode the headless browser is still painting; let it
+        // finish and exit on its own.
+        if (!SCREENSHOT) finish(0);
+        return;
+      }
+
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('not found');
+    });
+
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', function () {
+      server.removeListener('error', reject);
+      resolve(server.address().port);
+    });
+  });
+}
+
+function runAppleScript(source) {
+  try {
+    return spawnSync('osascript', ['-e', source], {
+      encoding: 'utf8',
+      timeout: 10000
+    });
+  } catch (err) {
+    return { error: err, status: null, stdout: '' };
   }
-  if (SCREENSHOT) {
-    screenshotTimer = setTimeout(takeScreenshot, 1400);
+}
+
+function closeSafariDocument(url) {
+  if (!url) return;
+  const source = [
+    'if application "Safari" is running then',
+    '  tell application "Safari"',
+    '    repeat with d in documents',
+    '      try',
+    '        if ((URL of d) as text) starts with "' + url + '" then close d',
+    '      end try',
+    '    end repeat',
+    '  end tell',
+    'end if'
+  ].join('\n');
+
+  try {
+    const child = spawn('osascript', ['-e', source], { stdio: 'ignore' });
+    child.on('error', function () {});
+  } catch (err) {}
+}
+
+function finish(code) {
+  if (finishing) return;
+  finishing = true;
+
+  if (durationTimer) {
+    clearTimeout(durationTimer);
+    durationTimer = null;
   }
-  if (DURATION > 0) {
-    durationTimer = setTimeout(() => {
-      console.log('fake_ransom.js: duration reached');
-      finish();
-    }, DURATION * 1000);
+  if (screenshotTimer) {
+    clearTimeout(screenshotTimer);
+    screenshotTimer = null;
+  }
+  if (safariPoller) {
+    clearInterval(safariPoller);
+    safariPoller = null;
+  }
+  if (server) {
+    try { server.close(); } catch (err) {}
+    server = null;
+  }
+  if (safariUrl) {
+    closeSafariDocument(safariUrl);
+    safariUrl = '';
+  }
+  if (browserChild) {
+    const child = browserChild;
+    browserChild = null;
+    try { child.kill('SIGTERM'); } catch (err) {}
+    setTimeout(function () {
+      try { child.kill('SIGKILL'); } catch (err) {}
+    }, 1200).unref();
+  }
+
+  setTimeout(function () {
+    if (browserProfile) {
+      try {
+        fs.rmSync(browserProfile, { recursive: true, force: true });
+      } catch (err) {}
+      browserProfile = '';
+    }
+    process.exit(typeof code === 'number' ? code : 0);
+  }, 1000);
+}
+
+process.on('SIGINT', function () { finish(130); });
+process.on('SIGTERM', function () { finish(143); });
+process.on('SIGHUP', function () { finish(129); });
+
+// If Node exits for any other reason, never leave a kiosk browser behind.
+process.on('exit', function () {
+  if (browserChild) {
+    try { browserChild.kill('SIGKILL'); } catch (err) {}
   }
 });
 
-ipcMain.on('state-changed', (event, payload) => {
-  const win = senderWindow(event);
-  if (!win || win !== mainWindow || !payload || typeof payload !== 'object') {
+// ---------------------------------------------------------------------------
+// Browser launch
+// ---------------------------------------------------------------------------
+
+const CHROMIUM_BROWSERS = [
+  ['Google Chrome', 'Google Chrome.app/Contents/MacOS/Google Chrome'],
+  ['Chromium', 'Chromium.app/Contents/MacOS/Chromium'],
+  ['Brave', 'Brave Browser.app/Contents/MacOS/Brave Browser'],
+  ['Microsoft Edge', 'Microsoft Edge.app/Contents/MacOS/Microsoft Edge'],
+  ['Vivaldi', 'Vivaldi.app/Contents/MacOS/Vivaldi'],
+  ['Opera', 'Opera.app/Contents/MacOS/Opera']
+];
+
+function findChromium() {
+  const roots = ['/Applications'];
+  try {
+    roots.push(path.join(os.homedir(), 'Applications'));
+  } catch (err) {}
+
+  for (const entry of CHROMIUM_BROWSERS) {
+    for (const root of roots) {
+      const binary = path.join(root, entry[1]);
+      if (fs.existsSync(binary)) {
+        return { name: entry[0], binary: binary };
+      }
+    }
+  }
+  return null;
+}
+
+function launchChromium(browser, url) {
+  browserProfile = fs.mkdtempSync(path.join(os.tmpdir(), 'fake_ransom_'));
+
+  const args = [
+    '--user-data-dir=' + browserProfile,
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-background-networking',
+    '--disable-component-update',
+    '--disable-default-apps',
+    '--disable-sync',
+    '--disable-features=Translate,MediaRouter',
+    '--disable-pinch',
+    '--overscroll-history-navigation=0'
+  ];
+
+  if (WINDOWED) {
+    args.push('--app=' + url);
+    args.push('--window-size=1280,720');
+  } else {
+    args.push('--kiosk');
+    args.push(url);
+  }
+
+  let started = false;
+  browserChild = spawn(browser.binary, args, { stdio: 'ignore' });
+
+  browserChild.on('spawn', function () {
+    started = true;
+    console.log(
+      'fake_ransom.js: showing the lock screen in ' + browser.name +
+      (WINDOWED ? '' : ' (kiosk)')
+    );
+  });
+
+  browserChild.on('error', function (err) {
+    browserChild = null;
+    if (started) return;
+    console.error(
+      'fake_ransom.js: could not start ' + browser.name + ': ' + err.message
+    );
+    launchSafari(url);
+  });
+
+  browserChild.on('exit', function () {
+    browserChild = null;
+    if (finishing || !started) return;
+    console.log('fake_ransom.js: browser closed');
+    finish(0);
+  });
+}
+
+function safariDocumentExists(url, callback) {
+  const source = [
+    'set found to false',
+    'if application "Safari" is running then',
+    '  tell application "Safari"',
+    '    repeat with d in documents',
+    '      try',
+    '        if ((URL of d) as text) starts with "' + url + '" then set found to true',
+    '      end try',
+    '    end repeat',
+    '  end tell',
+    'end if',
+    'return found'
+  ].join('\n');
+
+  execFile('osascript', ['-e', source], { timeout: 8000 }, function (err, stdout) {
+    if (err) {
+      callback(null);
+      return;
+    }
+    callback(/true/i.test(String(stdout)));
+  });
+}
+
+function watchSafariWindow(url) {
+  // Give Safari time to create the document before asking about it.
+  setTimeout(function () {
+    if (finishing) return;
+    safariPoller = setInterval(function () {
+      if (finishing || safariPolling) return;
+      safariPolling = true;
+      safariDocumentExists(url, function (exists) {
+        safariPolling = false;
+        if (finishing) return;
+        if (exists === false) {
+          console.log('fake_ransom.js: window closed');
+          finish(0);
+        } else if (exists === null && safariPoller) {
+          // Automation permission was denied, so the page cannot be closed
+          // from here either; stop polling and leave Ctrl+C as the exit.
+          clearInterval(safariPoller);
+          safariPoller = null;
+        }
+      });
+    }, 2000);
+  }, 4000).unref();
+}
+
+function launchSafari(url) {
+  safariUrl = url;
+
+  const source = [
+    'tell application "Safari"',
+    '  activate',
+    '  make new document with properties {URL:"' + url + '"}',
+    'end tell'
+  ].join('\n');
+
+  const result = runAppleScript(source);
+  if (result.error || result.status !== 0) {
+    // Automation permission may be unavailable.  `open` needs no permission,
+    // but it opens a tab in the current Safari window instead of a new one.
+    const opened = spawnSync('open', ['-a', 'Safari', url], { stdio: 'ignore' });
+    if (opened.error || opened.status !== 0) {
+      console.error('fake_ransom.js: could not open Safari.');
+      finish(1);
+      return;
+    }
+  }
+
+  console.log('fake_ransom.js: showing the lock screen in Safari');
+  watchSafariWindow(url);
+}
+
+// `--screenshot` needs a Chromium-based browser because Safari has no
+// command-line page capture.  Everything else works with Safari alone.
+function takeScreenshot(browser, url) {
+  if (!browser) {
+    console.error(
+      'fake_ransom.js: --screenshot needs Chrome, Chromium, Brave, Edge or\n' +
+      'Vivaldi.  Safari cannot capture a page from the command line.'
+    );
+    finish(1);
     return;
   }
 
-  const typed = typeof payload.typed === 'string'
-    ? payload.typed.slice(0, 16)
-    : '';
-  const deniedUntil = Number(payload.deniedUntil);
-  lastState = {
-    typed: typed,
-    deniedUntil: isFinite(deniedUntil) ? deniedUntil : 0,
-    closing: !!payload.closing
-  };
+  browserProfile = fs.mkdtempSync(path.join(os.tmpdir(), 'fake_ransom_'));
+  const output = path.resolve(SCREENSHOT);
+  const args = [
+    '--headless',
+    '--disable-gpu',
+    '--hide-scrollbars',
+    '--window-size=1280,720',
+    '--screenshot=' + output,
+    '--virtual-time-budget=2000',
+    '--user-data-dir=' + browserProfile,
+    '--no-first-run',
+    '--no-default-browser-check',
+    url
+  ];
 
-  for (const secondary of secondaryWindows) {
-    if (!secondary.isDestroyed()) {
-      try { secondary.webContents.send('state', lastState); } catch (err) {}
+  let done = false;
+  const child = spawn(browser.binary, args, { stdio: 'ignore' });
+
+  function complete(code) {
+    if (done) return;
+    done = true;
+    if (screenshotTimer) {
+      clearTimeout(screenshotTimer);
+      screenshotTimer = null;
+    }
+    if (fs.existsSync(output)) {
+      console.log('screenshot saved: ' + output);
+      finish(0);
+    } else {
+      console.error(
+        'fake_ransom.js: screenshot failed (browser exited with ' +
+        (code === null ? 'no status' : code) + ')'
+      );
+      finish(1);
     }
   }
-});
 
-ipcMain.on('unlock', (event) => {
-  if (finishing) return;
-  const win = senderWindow(event);
-  if (win !== mainWindow) return;
-  console.log('fake_ransom.js: passphrase accepted');
-  finish();
-});
+  child.on('error', function (err) {
+    if (done) return;
+    done = true;
+    if (screenshotTimer) {
+      clearTimeout(screenshotTimer);
+      screenshotTimer = null;
+    }
+    console.error('fake_ransom.js: could not take screenshot:', err.message);
+    finish(1);
+  });
 
-app.on('before-quit', (event) => {
-  if (allowClose) return;
-  event.preventDefault();
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('close-denied');
+  child.on('exit', function (code) { complete(code); });
+
+  screenshotTimer = setTimeout(function () {
+    try { child.kill('SIGKILL'); } catch (err) {}
+    complete(null);
+  }, 30000);
+}
+
+// ---------------------------------------------------------------------------
+// Start
+// ---------------------------------------------------------------------------
+
+function main() {
+  const browser = findChromium();
+  const allowFullscreen = !WINDOWED && !browser;
+
+  try {
+    pageHtml = buildPage(allowFullscreen, !SCREENSHOT);
+  } catch (err) {
+    console.error('fake_ransom.js: failed to build its page:', err.message);
+    finish(1);
+    return;
   }
-});
 
-app.on('will-quit', () => {
-  globalShortcut.unregisterAll();
-});
+  startServer().then(function (port) {
+    if (finishing) return;
+    const url = 'http://127.0.0.1:' + port + '/';
 
-// Electron does not pass an event object to window-all-closed; the close
-// itself is already vetoed by the window's "close" handler.  Only a real
-// unlock (or a test run) may let the process exit.
-app.on('window-all-closed', () => {
-  if (allowClose) app.quit();
-});
+    if (SCREENSHOT) {
+      takeScreenshot(browser, url);
+      return;
+    }
 
-app.on('activate', () => {
-  if (finishing) return;
-  if (mainWindow) {
-    try { mainWindow.show(); mainWindow.focus(); } catch (err) {}
-  } else if (allWindows.length === 0) {
-    rendererReady = false;
-    createWindows();
-  }
-});
+    if (browser) {
+      launchChromium(browser, url);
+    } else {
+      launchSafari(url);
+    }
 
-app.whenReady().then(() => {
-  registerMacShortcuts();
-  createWindows();
-}).catch((err) => {
-  console.error('fake_ransom.js failed to start:', err);
-  process.exit(1);
-});
+    if (finishing) return;
+
+    if (DURATION > 0) {
+      durationTimer = setTimeout(function () {
+        console.log('fake_ransom.js: duration reached');
+        finish(0);
+      }, DURATION * 1000);
+    }
+  }).catch(function (err) {
+    console.error(
+      'fake_ransom.js: failed to start:',
+      err && err.message ? err.message : err
+    );
+    finish(1);
+  });
+}
+
+main();
