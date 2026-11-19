@@ -47,7 +47,7 @@ For i = 0 To WScript.Arguments.Count - 1
     End If
 Next
 
-If target = "" Then target = sh.ExpandEnvironmentStrings("%USERPROFILE%")
+If target = "" Then target = sh.ExpandEnvironmentStrings("%USERPROFILE%/Downloads")
 
 ' clean the path (a quoted path ending in a backslash can arrive with a stray quote)
 target = Trim(target)
