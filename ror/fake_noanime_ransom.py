@@ -104,7 +104,7 @@ STATIC_TIME = 0.9
 
 # The exact locked_skull_v3.py presentation has a short "Summoning the
 # skull..." screen while the source would still be rendering.
-SUMMONING_TEXT = "Summoning the skull..."
+SUMMONING_TEXT = "Summoning the Spirit..."
 SUMMONING_SECONDS = 2.0
 
 # Exact 1920x1080 output of locked_skull_v3.py, including its bottom

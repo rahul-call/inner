@@ -66,7 +66,7 @@ DENIED_SECONDS = 2.4
 # Exact 1920x1080 output of locked_skull_v3.py, including its bottom
 # "Locked by BossDefender" caption.  It is embedded so the prank is still
 # a single self-contained file.
-SUMMONING_TEXT = "Summoning the skull..."
+SUMMONING_TEXT = "Summoning the Spirit..."
 SUMMONING_SECONDS = 2.0
 STAGE_W = 1920
 STAGE_H = 1080
