@@ -51,7 +51,7 @@ http = 'http'
 https = 'https'
 connection_type = auto         # <- auto / https / http / tcp
 
-DEFAULT_IP = 'https://omarchy.taile8340b.ts.net'
+DEFAULT_IP = '192.168.0.113'
 DEFAULT_PORT = 4444
 RETRY_DELAY = 1               # seconds between reconnect attempts
 CONNECT_TIMEOUT = 3           # seconds a TCP connect may take before we retry
@@ -92,6 +92,13 @@ SCREEN_SIZE = (960, 540)      # screen share frame size (width, height)
 SCREEN_JPEG_QUALITY = 70      # JPEG quality for streamed frames
 SCREENSHOT_JPEG_QUALITY = 85  # JPEG quality for one-shot screenshots
 SCREEN_SEND_TIMEOUT = 30      # seconds a send may stall before we give up
+SCREEN_DEFAULT_FPS = 12       # default pace; a share must not flood a tunnel
+FRAME_ACK_WINDOW = 2          # max frames in flight when the controller acks
+FRAME_ACK_STALL = 6.0         # no ack for this long -> continue (old controller)
+# One stable id per client process.  The controller uses it to recognise a
+# reconnect of the same machine, keep its session number and replace the old
+# (possibly half-dead) link immediately instead of opening an inactive session.
+INSTANCE_ID = secrets.token_hex(16)
 SEND_TIMEOUT = 2              # seconds one blocking send() may park in the kernel
 SEND_CHUNK = 512 * 1024       # write in bounded pieces so a stuck peer can't park a thread
 SOCKET_BUFFER = 4 * 1024 * 1024   # kernel TCP/socketpair buffers (file-share tuning)
@@ -552,6 +559,68 @@ CANCELED_LOCK = threading.Lock()
 DEFERRED = []                   # requests that arrived while a command was running
 MAX_DEFERRED = 32               # bound queued requests so a slow command cannot OOM
 MAX_DEFERRED_BYTES = 128 * 1024 * 1024
+
+# Concurrent command jobs.  A long command or upex must not pin the receive
+# loop: the controller can press Ctrl+B (or just start another operation) and
+# keep sending requests while the first one still runs on the client.  Each
+# request gets its own worker and its own cancel event, so several long
+# processes can run side by side and Ctrl+Z stops exactly the right one.
+ACTIVE_JOBS = {}                # request id -> job dict
+ACTIVE_JOBS_LOCK = threading.Lock()
+MAX_ACTIVE_JOBS = 32            # bound concurrent processes on a small device
+
+
+def _new_job(req_id):
+    """State shared between the receive loop and one command worker."""
+    return {
+        'id': req_id,           # request id (None when the controller sent none)
+        'cancel': threading.Event(),
+        'why': 'Ctrl+Z',        # shown in the 'stopped' note
+        'proc': None,           # the running Popen, so a cancel can kill it now
+        'killed': False,        # set by the receive loop when it cancels us
+        'lock': threading.Lock(),
+    }
+
+
+def _register_job(job):
+    """Publish a job so a later 'cancel' can find it. Returns False if full."""
+    if not _valid_req_id(job['id']):
+        return True             # no id: it can run but cannot be canceled
+    with ACTIVE_JOBS_LOCK:
+        if len(ACTIVE_JOBS) >= MAX_ACTIVE_JOBS:
+            return False
+        ACTIVE_JOBS[job['id']] = job
+        return True
+
+
+def _unregister_job(job):
+    if not _valid_req_id(job['id']):
+        return
+    with ACTIVE_JOBS_LOCK:
+        if ACTIVE_JOBS.get(job['id']) is job:
+            del ACTIVE_JOBS[job['id']]
+
+
+def _cancel_job(job, why='Ctrl+Z'):
+    """Cancel one job: set its event and kill its process tree immediately."""
+    job['why'] = why
+    job['cancel'].set()
+    with job['lock']:
+        proc = job['proc']
+    if proc is not None:
+        job['killed'] = True
+        try:
+            _kill_process(proc)
+        except Exception:
+            pass
+
+
+def _cancel_all_jobs(why):
+    """Cancel every running command (Ctrl+Z for all, exit, or a lost link)."""
+    with ACTIVE_JOBS_LOCK:
+        jobs = list(ACTIVE_JOBS.values())
+    for job in jobs:
+        _cancel_job(job, why)
 
 
 def _send_chunked(conn, payload, stall_timeout=None, deadline=None):
@@ -2772,6 +2841,96 @@ def grab_screen(fast=False):
         ' | '.join(errors), hint), errors)
 
 
+# Per-frame credit.  The controller acknowledges each frame it has consumed;
+# the stream worker then captures the *next* frame only when credit is free.
+# Without this a slow tunnel buffers several seconds of old pictures.
+FRAME_ACK_LOCK = threading.Lock()
+FRAME_ACK_COND = threading.Condition(FRAME_ACK_LOCK)
+FRAME_ACK = {'active': False, 'id': None, 'sent': 0, 'acked': 0}
+LINK_FEATURES = {'frame_ack': False}
+
+
+def _set_link_features(ack):
+    """Remember what the controller negotiated in hello_ack."""
+    enabled = bool(isinstance(ack, dict) and ack.get('frame_ack'))
+    LINK_FEATURES['frame_ack'] = enabled
+
+
+def _stream_ack_begin(req_id):
+    """Start credit tracking for one stream. True = frames are acknowledged."""
+    use_ack = bool(LINK_FEATURES.get('frame_ack')) and req_id is not None
+    with FRAME_ACK_COND:
+        FRAME_ACK.update(active=use_ack, id=req_id, sent=0, acked=0)
+        FRAME_ACK_COND.notify_all()
+    return use_ack
+
+
+def _stream_ack_end(req_id):
+    with FRAME_ACK_COND:
+        if FRAME_ACK.get('id') == req_id:
+            FRAME_ACK.update(active=False, sent=0, acked=0)
+            FRAME_ACK_COND.notify_all()
+
+
+def _note_frame_ack(msg):
+    """Consume one frame_ack from the controller (called by the reader loop)."""
+    rid = msg.get('id')
+    try:
+        seq = int(msg.get('seq'))
+    except (TypeError, ValueError):
+        return
+    with FRAME_ACK_COND:
+        if not FRAME_ACK.get('active') or FRAME_ACK.get('id') != rid:
+            return                  # late ack from an older share
+        # The controller counts frames itself.  Never let a malformed or stale
+        # value grant more credit than frames actually sent.
+        seq = min(seq, FRAME_ACK['sent'])
+        if seq > FRAME_ACK['acked']:
+            FRAME_ACK['acked'] = seq
+            FRAME_ACK_COND.notify_all()
+
+
+def _note_frame_sent():
+    with FRAME_ACK_COND:
+        FRAME_ACK['sent'] += 1
+
+
+def _wait_frame_credit(stop_event):
+    """Wait until another frame may be sent.
+
+    Returns 'ok', 'stop' or 'timeout'.  A controller that advertised acks but
+    stopped sending them (very old build, broken tunnel) must not freeze the
+    share: after FRAME_ACK_STALL seconds the worker falls back to paced sending.
+    """
+    deadline = time.monotonic() + FRAME_ACK_STALL
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            return 'stop'
+        with FRAME_ACK_COND:
+            if not FRAME_ACK.get('active'):
+                return 'timeout'
+            if FRAME_ACK['sent'] < FRAME_ACK['acked'] + FRAME_ACK_WINDOW:
+                return 'ok'
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # Stop expecting acks for the rest of this share; keep video
+                # flowing rather than showing a frozen screen.
+                FRAME_ACK['active'] = False
+                return 'timeout'
+            FRAME_ACK_COND.wait(min(0.1, remaining))
+
+
+def _sleep_until(deadline, stop_event):
+    """Sleep to an absolute monotonic deadline, waking quickly for Stop."""
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True
+        if stop_event is not None and stop_event.is_set():
+            return False
+        time.sleep(min(0.05, remaining))
+
+
 def _send_frame(conn, jpeg):
     """Write one JPEG frame ('\\x01' marks it as a frame, not JSON).
 
@@ -2802,70 +2961,100 @@ def stream_screen(conn, fps=None, stop_event=None, req_id=None):
     failed = False
     last_size = None
     # Large frames on a limited tunnel used to make motion crawl.  Start at
-    # the normal size/quality, then step down only when the send itself is
-    # slow; recover gradually on a fast link.  Capture cost is deliberately
-    # not part of this decision (lower JPEG quality cannot speed up a grab).
+    # the normal size/quality, then step down when this link is slow; recover
+    # gradually when it is fast.  With acknowledgements the credit wait is
+    # real backpressure, so it counts as load too.
     sizes = [SCREEN_SIZE, (854, 480), (768, 432), (640, 360)]
     size_index = 0
     quality = SCREEN_JPEG_QUALITY
     slow_frames = 0
     fast_frames = 0
-    target_interval = interval if interval else 1.0 / 12.0
+    # A share never floods the tunnel by default.  Before this, no fps meant
+    # "send as fast as the screen can be encoded", which filled every queue
+    # between the client and the browser with stale frames.
+    target_interval = interval if interval else 1.0 / SCREEN_DEFAULT_FPS
     slow_threshold = max(0.12, target_interval * 0.8)
-    while stop_event is None or not stop_event.is_set():
-        start = time.time()
-        try:
-            # Sample the pointer before a slow grab so the arrow belongs to
-            # this frame rather than jumping ahead while the capture runs.
-            pointer = None
-            if last_size is not None:
-                pointer = _cursor_hotspot(last_size)
-            img = grab_screen(fast=True)
-            img = _fit_screen(img, sizes[size_index])
-            if pointer is not None and last_size:
-                pointer = (pointer[0] * img.width / float(last_size[0]),
-                           pointer[1] * img.height / float(last_size[1]))
-            img = _draw_cursor_overlay(img, pointer)
-            last_size = img.size
-            buf = io.BytesIO()
-            img.save(buf, 'JPEG', quality=quality)
-        except Exception as e:
-            send_msg(conn, {'type': 'error', 'id': req_id,
-                            'data': 'screenshot failed: {}'.format(e),
-                            'diag': _capture_diag(e)})
-            failed = True
-            break
+    use_ack = _stream_ack_begin(req_id)
+    try:
+        while stop_event is None or not stop_event.is_set():
+            # Monotonic time: _sleep_until/_wait_frame_credit use monotonic
+            # deadlines, and a wall-clock jump must not stall the share.
+            start = time.monotonic()
+            credit_wait = 0.0
+            if use_ack:
+                decision = _wait_frame_credit(stop_event)
+                if decision == 'stop':
+                    break
+                if decision == 'timeout':
+                    use_ack = False
+                else:
+                    credit_wait = time.monotonic() - start
+            try:
+                # Sample the pointer before a slow grab so the arrow belongs to
+                # this frame rather than jumping ahead while the capture runs.
+                pointer = None
+                if last_size is not None:
+                    pointer = _cursor_hotspot(last_size)
+                img = grab_screen(fast=True)
+                img = _fit_screen(img, sizes[size_index])
+                if pointer is not None and last_size:
+                    pointer = (pointer[0] * img.width / float(last_size[0]),
+                               pointer[1] * img.height / float(last_size[1]))
+                img = _draw_cursor_overlay(img, pointer)
+                last_size = img.size
+                buf = io.BytesIO()
+                img.save(buf, 'JPEG', quality=quality)
+            except Exception as e:
+                try:
+                    send_msg(conn, {'type': 'error', 'id': req_id,
+                                    'data': 'screenshot failed: {}'.format(e),
+                                    'diag': _capture_diag(e)})
+                except OSError:
+                    pass
+                failed = True
+                break
 
-        send_start = time.time()
-        _send_frame(conn, buf.getvalue())                 # OSError -> reconnect
-        send_elapsed = time.time() - send_start
-        if send_elapsed > slow_threshold:
-            fast_frames = 0
-            slow_frames += 1
-            if slow_frames >= 2:
-                slow_frames = 0
-                if quality > 50:
-                    quality = max(50, quality - 6)
-                elif size_index + 1 < len(sizes):
-                    size_index += 1
-        elif send_elapsed < min(0.08, slow_threshold * 0.55):
-            slow_frames = 0
-            fast_frames += 1
-            if fast_frames >= 12:
+            send_start = time.monotonic()
+            if use_ack:
+                # Count before writing: the controller can acknowledge the
+                # frame before this thread resumes, and an ack for an unseen
+                # sequence number must still be accepted.
+                _note_frame_sent()
+            _send_frame(conn, buf.getvalue())             # OSError -> reconnect
+            send_elapsed = time.monotonic() - send_start
+            load = max(send_elapsed, credit_wait) if use_ack else send_elapsed
+            if load > slow_threshold:
                 fast_frames = 0
-                if quality < SCREEN_JPEG_QUALITY:
-                    quality = min(SCREEN_JPEG_QUALITY, quality + 3)
-                elif size_index > 0:
-                    size_index -= 1
+                slow_frames += 1
+                if slow_frames >= 2:
+                    slow_frames = 0
+                    if quality > 50:
+                        quality = max(50, quality - 6)
+                    elif size_index + 1 < len(sizes):
+                        size_index += 1
+            elif load < min(0.08, slow_threshold * 0.55):
+                slow_frames = 0
+                fast_frames += 1
+                if fast_frames >= 12:
+                    fast_frames = 0
+                    if quality < SCREEN_JPEG_QUALITY:
+                        quality = min(SCREEN_JPEG_QUALITY, quality + 3)
+                    elif size_index > 0:
+                        size_index -= 1
 
-        if interval:
-            elapsed = time.time() - start
-            if elapsed < interval:
-                time.sleep(interval - elapsed)
+            # Always pace to the requested/default rate.  If capture or the
+            # link already took longer, this is a no-op.
+            if not _sleep_until(start + target_interval, stop_event):
+                break
+    finally:
+        _stream_ack_end(req_id)
 
     if not failed:
-        send_msg(conn, {'type': 'output', 'id': req_id,
-                        'data': '[client] screen share stopped'})
+        try:
+            send_msg(conn, {'type': 'output', 'id': req_id,
+                            'data': '[client] screen share stopped'})
+        except OSError:
+            pass
 
 
 STREAM_LOCK = threading.Lock()
@@ -4736,17 +4925,22 @@ def _decode_command_output(data):
     return data.decode('utf-8', errors='replace')
 
 
-def run_command(conn, command, current_dir, req_id=None):
+def run_command(conn, command, current_dir, req_id=None, job=None):
     """Run one shell command and return (output_text, stop, exit_code).
 
     The command gets its own session/process group, so the whole tree can be
-    killed when the controller sends 'cancel' with this request's id (its
-    Ctrl+Z) or when the control connection dies. stop=True means the
-    controller asked us to exit. exit_code is the real process status for a
-    normally finished command; it is None when the command was stopped or the
-    controller disappeared. Requests that arrive while the command runs are
-    queued (DEFERRED) instead of being dropped, so a background operation on
-    the controller side still gets its answer."""
+    killed when the controller cancels this request (Ctrl+Z / 'stop') or when
+    the control connection dies.  exit_code is the real process status for a
+    normally finished command; it is None when the command was stopped.
+
+    The control socket is *not* read here any more.  `job` carries an Event
+    that the receive loop sets to cancel this command, so this function never
+    competes with the single receive loop for messages: that is what lets
+    several long commands run at once after the controller presses Ctrl+B."""
+    own_job = job is None
+    if own_job:
+        job = _new_job(req_id)
+        _register_job(job)
     if os.name == 'nt':
         kwargs = {'creationflags': (subprocess.CREATE_NEW_PROCESS_GROUP
                                     | CREATE_NO_WINDOW)}
@@ -4761,6 +4955,8 @@ def run_command(conn, command, current_dir, req_id=None):
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 **kwargs)
     except Exception as e:
+        if own_job:
+            _unregister_job(job)
         return '{}'.format(e), False, 127
 
     chunks = []
@@ -4821,13 +5017,23 @@ def run_command(conn, command, current_dir, req_id=None):
 
     reader_thread = threading.Thread(target=reader, daemon=True)
     reader_thread.start()
+    with job['lock']:
+        job['proc'] = proc          # a cancel from the receive loop can kill it
 
-    killed = truncated = stop = disconnected = False
+    killed = truncated = stop = False
     kill_why = 'Ctrl+Z'
     shell_exited_at = None
     clean_exit = False
     exit_code = None
     while True:
+        if job['cancel'].is_set():
+            # Ctrl+Z / 'stop' on the controller (or a lost connection, which
+            # cancels every job): stop this command's whole process tree.
+            kill_why = job.get('why') or 'Ctrl+Z'
+            job['killed'] = True
+            _kill_process(proc)
+            killed = True
+            break
         if size[0] >= MAX_OUTPUT and not truncated:
             # The command writes faster than any link could carry: stop
             # collecting output (the reader thread keeps draining the pipe, so
@@ -4850,92 +5056,21 @@ def run_command(conn, command, current_dir, req_id=None):
                 except Exception:
                     exit_code = None
                 break
-        # Wait for a control message - or, on POSIX, for the command's output
-        # pipe to hit EOF, which happens the instant it exits. That is what
-        # makes a short command return immediately instead of waiting for a
-        # poll tick (this was a fixed 200 ms cost on every single command).
-        if os.name == 'nt':
-            watch, timeout = [conn], 0.02        # Windows: sockets only in select
-        elif not reader_done.is_set():
-            # A command can keep running after it closes or redirects stdout
-            # (`exec >/dev/null; long-job`). Once the pipe is at EOF it stays
-            # readable forever; selecting it again would spin this loop at
-            # 1000 Hz for the whole command. Poll only the control socket.
-            watch, timeout = [conn, proc.stdout], 0.2
+        # This worker never reads the control socket: the single receive loop
+        # in main() owns it and routes frames, cancels, transfers and new
+        # requests.  Wait for output/EOF (which makes short commands return
+        # immediately) or for our own cancel event.  Because the wait is
+        # short, a Ctrl+Z kills the process within a tick.
+        if os.name == 'nt' or reader_done.is_set():
+            job['cancel'].wait(0.05)
         else:
-            watch, timeout = [conn], 0.2
-        # select() only sees the kernel socket.  An SSLSocket may already have
-        # decrypted a cancel message in its private buffer, so include it as
-        # readable without waiting for more network traffic.
-        if _socket_pending(conn) > 0:
-            readable = [conn]
-        else:
-            readable, _, _ = select.select(watch, [], [], timeout)
+            readable, _, _ = select.select([proc.stdout], [], [], 0.05)
+            if proc.stdout in readable:
+                time.sleep(0.001)   # output flowing: let the reader drain it
 
-        if conn in readable:
-            msg = recv_msg(conn)
-            if msg is None:                     # controller gone: stop, reconnect
-                _kill_process(proc)
-                disconnected = True
-                break
-            mtype = msg.get('type')
-            if mtype == 'cancel':
-                # Ctrl+Z / 'stop' on the controller: it names the request to stop.
-                target = msg.get('id')
-                why = msg.get('why') or 'Ctrl+Z'
-                if target is None or target == req_id:
-                    kill_why = why
-                    _kill_process(proc)
-                    killed = True
-                else:
-                    _mark_canceled(target, why)  # a queued request: skip it later
-                    key = _incoming_key(target)
-                    state = (INCOMING_TRANSFERS.get(key)
-                             if key is not None else None)
-                    if state is not None:
-                        state.abort({'reason': why})
-                    _outgoing_cancel(target)
-            elif mtype == 'cmd_kill':           # older controller: stop this one
-                _kill_process(proc)
-                killed = True
-            elif mtype == 'screenshare_stop':
-                stop_stream(wait=0.5)           # a share can run next to a command
-            elif mtype == 'exit':
-                _kill_process(proc)
-                stop = True
-                break
-            elif mtype in ('transfer_begin', 'transfer_entries',
-                           'transfer_file_begin', 'transfer_chunk',
-                           'transfer_file_end', 'transfer_abort',
-                           'transfer_end'):
-                # A background upload may run while this command does.  Feed
-                # its stream to the receive state instead of deferring chunks
-                # (the bounded queue would reject most of a large file).
-                _handle_transfer_message(conn, msg, msg.get('id'), current_dir)
-            elif mtype == 'download':
-                # Let a background download start now instead of waiting for
-                # a long command; its worker only writes to the socket.
-                _serve_download_request(conn, msg, msg.get('id'), current_dir)
-            else:
-                # A request sent while this command runs (the controller can
-                # have several operations in flight now): answer it once this
-                # command is done instead of dropping it - dropping it would
-                # leave that operation hanging forever. The queue is bounded.
-                deferred_id = msg.get('id')
-                if not _defer_message(msg):
-                    if deferred_id is not None and _valid_req_id(deferred_id):
-                        try:
-                            send_msg(conn, {'type': 'error', 'id': deferred_id,
-                                            'data': 'client busy: request queue is full'})
-                        except OSError:
-                            pass
-            continue
-
-        if os.name != 'nt' and proc.stdout in readable:
-            time.sleep(0.001)           # output flowing: let the reader drain it
-            continue
-
-    if clean_exit and not (killed or disconnected or stop):
+    with job['lock']:
+        job['proc'] = None
+    if clean_exit and not (killed or stop):
         _cleanup_leftover_group(proc.pid)
     stop_reader.set()
     reader_thread.join(timeout=1.5)
@@ -4951,8 +5086,6 @@ def run_command(conn, command, current_dir, req_id=None):
     notes = []
     if killed:
         notes.append('[client] command stopped by the controller ({})'.format(kill_why))
-    if disconnected:
-        notes.append('[client] controller disconnected - command stopped')
     if truncated:
         notes.append('[client] output cut off after {} MB (the command kept running)'.format(
             '{:g}'.format(round(MAX_OUTPUT / (1024.0 * 1024.0), 2))))
@@ -4960,8 +5093,10 @@ def run_command(conn, command, current_dir, req_id=None):
         if text and not text.endswith('\n'):
             text += '\n'
         text += '\n'.join(notes)
-    if killed or disconnected or stop:
+    if killed or stop:
         exit_code = None
+    if own_job:
+        _unregister_job(job)
     return text, stop, exit_code
 
 
@@ -5254,7 +5389,7 @@ def _upex_append(parts, text):
         parts.append(text)
 
 
-def _upex_execute_attempts(conn, req_id, current_dir, attempts):
+def _upex_execute_attempts(conn, req_id, current_dir, attempts, job=None):
     """Try commands in order; stop at the first success.
 
     A successful compile attempt with a ``run`` command immediately runs that
@@ -5265,7 +5400,7 @@ def _upex_execute_attempts(conn, req_id, current_dir, attempts):
     last_code = None
     for index, attempt in enumerate(attempts):
         text, stop, code = run_command(
-            conn, attempt['command'], current_dir, req_id)
+            conn, attempt['command'], current_dir, req_id, job)
         _upex_append(parts, text)
         if stop or code is None:
             return '\n'.join(parts), stop, code
@@ -5274,7 +5409,7 @@ def _upex_execute_attempts(conn, req_id, current_dir, attempts):
             run = attempt.get('run')
             if not run:
                 return '\n'.join(parts), False, 0
-            text, stop, code = run_command(conn, run, current_dir, req_id)
+            text, stop, code = run_command(conn, run, current_dir, req_id, job)
             _upex_append(parts, text)
             return '\n'.join(parts), stop, code
         if index + 1 < len(attempts):
@@ -5285,7 +5420,7 @@ def _upex_execute_attempts(conn, req_id, current_dir, attempts):
     return '\n'.join(parts), False, last_code
 
 
-def run_upex(conn, msg, current_dir, req_id=None):
+def run_upex(conn, msg, current_dir, req_id=None, job=None):
     """Handle one 'upex' request after the controller uploaded the file(s)."""
     app = _upex_simple_name(msg.get('app'))
     if not app:
@@ -5312,7 +5447,7 @@ def run_upex(conn, msg, current_dir, req_id=None):
         if error:
             return 'upex: {}'.format(error), False, 1
         text, stop, code = _upex_execute_attempts(
-            conn, req_id, current_dir, attempts)
+            conn, req_id, current_dir, attempts, job)
         if code not in (None, 0):
             note = '[upex] auto launcher exited with status {}'.format(code)
             text = '{}\n{}'.format(text, note) if text.strip() else note
@@ -5324,7 +5459,80 @@ def run_upex(conn, msg, current_dir, req_id=None):
     if error:
         return 'upex: {}'.format(error), False, 1
     return _upex_execute_attempts(
-        conn, req_id, current_dir, plan['attempts'])
+        conn, req_id, current_dir, plan['attempts'], job)
+
+
+# ---------------------------------------------------------------------------
+# Command workers.  A cmd/upex/screenshot runs in its own thread so the one
+# receive loop stays free: the controller can press Ctrl+B and send further
+# commands or applications while the first still runs, and each request is
+# answered independently.  Cancellation goes through the job's Event instead
+# of the socket, so two workers never steal each other's messages.
+# ---------------------------------------------------------------------------
+
+def _send_job_reply(conn, req_id, text, exit_code):
+    if not text:
+        text = '[no output]'
+    reply = {'type': 'output', 'id': req_id, 'data': text}
+    if exit_code is not None:
+        reply['exit_code'] = exit_code
+    try:
+        send_msg(conn, reply)
+    except OSError:
+        pass
+
+
+def _cmd_job(conn, command, current_dir, req_id, job):
+    try:
+        text, _stop, exit_code = run_command(
+            conn, command, current_dir, req_id, job)
+    except Exception as e:
+        text, exit_code = 'command failed: {}'.format(e), 127
+    _send_job_reply(conn, req_id, text, exit_code)
+
+
+def _upex_job(conn, msg, current_dir, req_id, job):
+    try:
+        text, _stop, exit_code = run_upex(conn, msg, current_dir, req_id, job)
+    except Exception as e:
+        text, exit_code = 'upex failed: {}'.format(e), 1
+    _send_job_reply(conn, req_id, text, exit_code)
+
+
+def _screenshot_job(conn, req_id, job):
+    try:
+        take_screenshot(conn, req_id)
+    except Exception as e:
+        try:
+            send_msg(conn, {'type': 'error', 'id': req_id,
+                            'data': 'screenshot failed: {}'.format(e)})
+        except OSError:
+            pass
+
+
+def _start_job(conn, req_id, target, args, name):
+    """Run target(*args, job) in a worker thread.
+
+    Returns False (and answers with an error) when too many operations are
+    already running, so a small device cannot be exhausted by a flood."""
+    job = _new_job(req_id)
+    if not _register_job(job):
+        try:
+            send_msg(conn, {'type': 'error', 'id': req_id,
+                            'data': 'client busy: too many background operations'})
+        except OSError:
+            pass
+        return False
+
+    def runner():
+        try:
+            target(*args, job)
+        finally:
+            _unregister_job(job)
+
+    threading.Thread(target=runner, name=name, daemon=True).start()
+    return True
+
 # ---------------------------------------------------------------------------
 # Auto-start ("persistence"): the client can install itself so it starts
 # quietly after a reboot/logon. Based on autorunner.py - lab use only.
@@ -7907,7 +8115,11 @@ def _recv_hello_ack(sock, timeout=TUNNEL_PROBE_TIMEOUT):
     except (AttributeError, OSError):
         pass
     try:
-        send_msg(sock, {'type': 'hello', 'env': environment_report()})
+        send_msg(sock, {'type': 'hello', 'env': environment_report(),
+                        'instance': INSTANCE_ID,
+                        # Ask the controller for one ack per consumed frame.
+                        # Older controllers ignore both fields harmlessly.
+                        'frame_ack': True})
         # recv_msg() uses select() for its stall timeout, which does not see
         # the Python socket timeout set above.  Pass an absolute deadline so a
         # buffering proxy fails over to the next transport in ~12 s instead of
@@ -7940,6 +8152,11 @@ def _open_controller_connection(host, port, scheme='auto', role='control',
     if cached and cached in candidates:
         candidates = [cached] + [item for item in candidates if item != cached]
     errors = []
+    if role == 'control':
+        # Never trust features from a dead control link.  A shell connection
+        # must not clear them: a screenshare on the control link may still be
+        # running, and future shares need the negotiated frame_ack.
+        _set_link_features(None)
     for family in candidates:
         # Within one HTTP(S) family, try WebSocket first (best through
         # tunnels), then the streaming POST, then the half-duplex fallback,
@@ -8001,7 +8218,8 @@ def _open_controller_connection(host, port, scheme='auto', role='control',
             try:
                 sock = factory()
                 if role == 'control':
-                    _recv_hello_ack(sock)
+                    ack = _recv_hello_ack(sock)
+                    _set_link_features(ack)
                 _remember_transport(key, variant)
                 return sock, family, variant
             except Exception as e:
@@ -8181,6 +8399,12 @@ def main():
                 if req_id is not None and not _valid_req_id(req_id):
                     req_id = None       # hostile JSON can't break cancel bookkeeping
 
+                if mtype == 'frame_ack':
+                    # Screen-share credit.  Handled here, before deferral: a
+                    # delayed ack would defeat the whole flow-control scheme.
+                    _note_frame_ack(msg)
+                    continue
+
                 # The controller stopped this request (Ctrl+Z / 'stop') before we
                 # got to it: answer and move on instead of running it.
                 if mtype not in ('exit', 'hello', 'cancel', 'cmd_kill',
@@ -8196,6 +8420,7 @@ def main():
 
                 if mtype == 'exit':
                     stop_stream(wait=0.5)
+                    _cancel_all_jobs('exit')     # long commands die with us
                     try:
                         send_msg(client_socket, {'type': 'output', 'id': req_id,
                                                  'data': '[client] shutting down'})
@@ -8220,66 +8445,45 @@ def main():
                                                  'data': output if output is not None else '[no output]'})
                         continue
 
-                    try:
-                        text, stop_requested, exit_code = run_command(
-                            client_socket, command, current_dir, req_id)
-                    except Exception as e:
-                        text, stop_requested, exit_code = (
-                            'command failed: {}'.format(e), False, 127)
-                    if stop_requested:
-                        # Honor an exit even if the controller closed the
-                        # socket without waiting for this final reply.
-                        stop = True
-                    if not text:
-                        text = '[no output]'
-                    reply = {'type': 'output', 'id': req_id, 'data': text}
-                    if exit_code is not None:
-                        reply['exit_code'] = exit_code
-                    try:
-                        send_msg(client_socket, reply)
-                    except OSError:
-                        if not stop:
-                            raise
-                    if stop_requested:
-                        break
+                    # Run in a worker so this receive loop stays free: the
+                    # controller can background it (Ctrl+B) and send more
+                    # commands while this one still runs.
+                    _start_job(client_socket, req_id, _cmd_job,
+                               (client_socket, command, current_dir, req_id),
+                               'cmd')
                     continue
 
                 if mtype == 'upex':
-                    try:
-                        text, stop_requested, exit_code = run_upex(
-                            client_socket, msg, current_dir, req_id)
-                    except Exception as e:
-                        text, stop_requested, exit_code = (
-                            'upex failed: {}'.format(e), False, 1)
-                    if stop_requested:
-                        stop = True
-                    if not text:
-                        text = '[no output]'
-                    reply = {'type': 'output', 'id': req_id, 'data': text}
-                    if exit_code is not None:
-                        reply['exit_code'] = exit_code
-                    try:
-                        send_msg(client_socket, reply)
-                    except OSError:
-                        if not stop:
-                            raise
-                    if stop_requested:
-                        break
+                    _start_job(client_socket, req_id, _upex_job,
+                               (client_socket, msg, current_dir, req_id),
+                               'upex')
                     continue
 
                 if mtype in ('cmd_kill', 'cancel'):
-                    if mtype == 'cancel':
+                    why = msg.get('why') or 'Ctrl+Z'
+                    job = None
+                    if _valid_req_id(req_id):
+                        with ACTIVE_JOBS_LOCK:
+                            job = ACTIVE_JOBS.get(req_id)
+                    if job is not None:
+                        # A cmd/upex/screenshot is running in a worker.
+                        _cancel_job(job, why)
+                    elif mtype == 'cmd_kill':
+                        # Older controller without a request id: stop them all.
+                        _cancel_all_jobs(why)
+                    else:
+                        # Not started yet: remember it so the loop skips it.
+                        _mark_canceled(req_id, why)
                         key = _incoming_key(req_id)
                         state = INCOMING_TRANSFERS.get(key) if key is not None else None
                         if state is not None:
                             # Keep consuming until transfer_end so the byte
                             # stream stays aligned, but discard the open file.
-                            state.abort({'reason': msg.get('why') or
-                                         'canceled by the controller'})
+                            state.abort({'reason': why})
                         # A download runs in its own worker so this message
                         # can stop it before another chunk is sent.
                         _outgoing_cancel(req_id)
-                    continue                # nothing else running: nothing to stop
+                    continue
 
                 if mtype == 'download':
                     _serve_download_request(client_socket, msg, req_id,
@@ -8343,7 +8547,10 @@ def main():
                     continue
 
                 if mtype == 'screenshot':
-                    take_screenshot(client_socket, req_id)
+                    # Also off the receive loop: a slow capture must not stop
+                    # the controller from typing the next command.
+                    _start_job(client_socket, req_id, _screenshot_job,
+                               (client_socket, req_id), 'screenshot')
                     continue
 
                 if mtype == 'persist':
@@ -8375,7 +8582,8 @@ def main():
                         STREAM['stop'] = stream_stop
                         STREAM['thread'] = stream_thread
                         STREAM['id'] = req_id
-                    print('[+] Screen share started ({} fps)'.format(msg.get('fps') or 'max'))
+                    print('[+] Screen share started ({} fps)'.format(
+                        msg.get('fps') or SCREEN_DEFAULT_FPS))
                     try:
                         stream_thread.start()
                     except Exception as e:
@@ -8416,6 +8624,7 @@ def main():
         except Exception as e:                  # never let one bad message kill us
             print("[!] Unexpected error: {}. Reconnecting...".format(e))
 
+        _cancel_all_jobs('controller disconnected')  # long commands die with the link
         stop_stream(wait=0.5)                   # a share cannot outlive its socket
         stop_shell()                            # ... and neither can an old shell
         _abort_outgoing_transfers()             # stop download workers
