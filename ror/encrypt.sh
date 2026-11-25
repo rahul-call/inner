@@ -432,7 +432,7 @@ all_pass() {
 #---------------------------------------------------------------------
 main() {
   
-  local MODE=encrypt TARGET="${HOME}/Downloads" SELFTEST_ONLY=0 ROOT isfile=0 nfiles nlinks ans p1 p2 f fd i total
+  local MODE=encrypt TARGET="${HOME}" SELFTEST_ONLY=0 ROOT isfile=0 nfiles nlinks ans p1 p2 f fd i total
   local ok=0 skipped=0 badpw=0 failed=0 aborted=0 pfx
 
   while [ $# -gt 0 ]; do
