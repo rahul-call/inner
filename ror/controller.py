@@ -6074,13 +6074,220 @@ def _upex_validate(app_type, os_name, auto_mode):
 
 _UPEX_CANCELED = object()
 
+# Worker threads print per-session upex lines at the same time; serialise the
+# lines so two sessions never interleave inside one message.
+_UPEX_PRINT_LOCK = threading.Lock()
 
-def _upex_upload_one(link, local_path, context=''):
-    """Upload one file synchronously and return its sanitized remote name.
+
+def _upex_say(text):
+    """Print one upex line from either the prompt thread or a session worker.
+
+    Uses the async-safe writer so a message never corrupts the live prompt
+    dashboard, exactly like every other background note."""
+    if not text:
+        return
+    with _UPEX_PRINT_LOCK:
+        _async_print(text)
+
+
+def _upex_wait(op, link, group=None):
+    """Wait for one op's answer, safe to call from a session worker.
+
+    ``wait_foreground`` is prompt-thread aware; from a worker it waits quietly
+    and returns 'background' as soon as the op is detached.  An upex *upload*
+    must not stop on Ctrl+B (the app still needs its file), so when a group is
+    given we keep waiting until the op really finishes or is cancelled."""
+    if group is None:
+        return wait_foreground(op, cancelable=True, backgroundable=False)
+    while not op.done.is_set() and not op.canceled and not link.dead:
+        time.sleep(0.02)
+    return 'dead' if link.dead else 'done'
+
+
+class _UpexGroup(object):
+    """Coordinates one parallel multi-session upex run.
+
+    It behaves like an Op for ``wait_foreground``: Ctrl+B detaches the whole
+    group (the prompt comes back while every session keeps uploading and
+    running) and Ctrl+Z cancels it.  Session workers register the ops they
+    create so a key press reaches all of them.  The last worker to finish
+    prints the per-session result line once."""
+
+    def __init__(self, link, targets, announce=True):
+        self.link = link
+        self.total = len(targets)
+        self.announce = announce       # print the per-session result line?
+        self.label = 'upex ({} sessions)'.format(self.total)
+        self.done = threading.Event()
+        self.background = False
+        self.canceled = False
+        self.why = 'Ctrl+Z'
+        self.lock = threading.Lock()
+        self.ops = []
+        self.results = {}
+        self._remaining = self.total
+        self._printed = False
+        for number, target in targets:
+            # A dead target still counts, so the group can complete.
+            self.results[number] = None
+
+    def register(self, op):
+        """Expose a freshly created op to group-wide detach/cancel."""
+        with self.lock:
+            self.ops.append(op)
+            background = self.background
+            canceled = self.canceled
+            why = self.why
+        if canceled:
+            # The key already arrived: cancel this op at once.  link is set
+            # before register(), so the cancel note has somewhere to go.
+            op.cancel(why)
+        elif background and op.kind == 'upex':
+            # Only the running app is backgrounded here; an upload must still
+            # finish so the app it carries can start.
+            op.background = True
+        return op
+
+    def unregister(self, op):
+        with self.lock:
+            if op in self.ops:
+                self.ops.remove(op)
+
+    def detach(self, announce=True):
+        with self.lock:
+            if self.background:
+                return
+            self.background = True
+            ops = list(self.ops)
+        if announce:
+            self.link.say(
+                "[+] Moved to the background: upex on {} session{}. Each "
+                "session keeps uploading and running on its client - 'jobs' "
+                "shows them, 'stop' ends them.".format(
+                    self.total, '' if self.total == 1 else 's'))
+        for op in ops:
+            if op.kind == 'upex':
+                op.detach()
+
+    def cancel(self, why='Ctrl+Z', announce=True):
+        with self.lock:
+            if self.canceled:
+                return
+            self.canceled = True
+            self.background = True      # wait_foreground must stop waiting
+            self.why = why
+            ops = list(self.ops)
+        if announce:
+            self.link.say("[+] {}: stopping upex on {} session{}...".format(
+                why, self.total, '' if self.total == 1 else 's'))
+        for op in ops:
+            op.cancel(why)
+
+    def finish(self, number, status):
+        """Record one session's result; the last one prints the summary."""
+        with self.lock:
+            self.results[number] = status
+            self._remaining -= 1
+            remaining = self._remaining
+        if remaining <= 0:
+            self.done.set()
+            self._print_results()
+
+    def _print_results(self):
+        with self.lock:
+            if self._printed:
+                return
+            self._printed = True
+            if not self.announce:
+                return
+            results = sorted(self.results.items())
+        words = {'done': 'done', 'failed': 'failed',
+                 'disconnected': 'disconnected', 'background': 'running',
+                 'canceled': 'canceled', 'error': 'failed'}
+        _upex_say("[+] upex results: {}".format(', '.join(
+            'session {}: {}'.format(number, words.get(status, status))
+            for number, status in results)))
+
+
+class _UpexChain(object):
+    """Waits for several upex groups of one '&' chain at the same time.
+
+    Each '&' segment keeps its own group (and its own result line), but every
+    segment starts immediately and runs independently.  Ctrl+B backgrounds the
+    whole chain and Ctrl+Z cancels it.  This object mirrors Op for
+    ``wait_foreground``: it only needs done/background/link and the two key
+    methods."""
+
+    def __init__(self, link):
+        self.link = link
+        self.done = threading.Event()
+        self.background = False
+        self.canceled = False
+        self.label = 'upex chain'
+        self.why = 'Ctrl+Z'
+        self.lock = threading.Lock()
+        self.groups = []
+        self._watching = False
+
+    def add(self, group):
+        with self.lock:
+            self.groups.append(group)
+            background = self.background
+            canceled = self.canceled
+            why = self.why
+        if canceled:
+            group.cancel(why, announce=False)
+        elif background:
+            group.detach(announce=False)
+        return group
+
+    def start(self):
+        with self.lock:
+            if self._watching:
+                return
+            self._watching = True
+        threading.Thread(target=self._watch, name='upex-chain', daemon=True).start()
+
+    def _watch(self):
+        while not self.canceled and not self.link.dead:
+            with self.lock:
+                groups = list(self.groups)
+            if groups and all(group.done.is_set() for group in groups):
+                self.done.set()
+                return
+            time.sleep(0.03)
+
+    def detach(self):
+        with self.lock:
+            if self.background:
+                return
+            self.background = True
+            groups = list(self.groups)
+        self.link.say("[+] Moved to the background: every upex in this chain "
+                      "keeps running on its client - 'jobs' shows them, "
+                      "'stop' ends them.")
+        for group in groups:
+            group.detach(announce=False)
+
+    def cancel(self, why='Ctrl+Z'):
+        with self.lock:
+            if self.canceled:
+                return
+            self.canceled = True
+            self.background = True
+            self.why = why
+            groups = list(self.groups)
+        self.link.say("[+] {}: stopping every upex in this chain...".format(why))
+        for group in groups:
+            group.cancel(why, announce=False)
+
+
+def _upex_upload_one(link, local_path, context='', group=None):
+    """Upload one file and return its sanitized remote name.
 
     Returns _UPEX_CANCELED when the user stopped the upload, and None when the
-    upload failed.  The caller must not run the app after a cancel.
-    """
+    upload failed.  The caller must not run the app after a cancel.  With a
+    group, Ctrl+Z reaches this upload but Ctrl+B does not stop it."""
     name = os.path.basename(local_path)
     op = Op('upload', next_request_id(), label='upex upload {}'.format(name))
     op.transfer_serial = next(TRANSFER_SERIAL)
@@ -6088,11 +6295,15 @@ def _upex_upload_one(link, local_path, context=''):
     op.transfer_kind = 'file'
     op.transfer_status = 'scanning'
     link.add(op)
-    print("[+] Uploading {}{}...".format(name, context))
+    if group is not None:
+        group.register(op)
+    _upex_say("[+] Uploading {}{}...".format(name, context))
     threading.Thread(target=_upload_transfer,
                      args=(link, op, local_path, None),
                      name='upex-upload', daemon=True).start()
-    status = wait_foreground(op, cancelable=True, backgroundable=False)
+    status = _upex_wait(op, link, group)
+    if group is not None:
+        group.unregister(op)
     remote_name = op.transfer_name
     if op.succeeded:
         link.drop(op)
@@ -6484,34 +6695,38 @@ def _upex_precheck(parsed, app_type, active_link, auto_mode=False):
 
 
 def _upex_run_target(link, number, parsed, app_path, app_type,
-                     auto_path, auto_type, auto_arg, total):
-    """Upload and run one app on one session. Returns a short status."""
+                     auto_path, auto_type, auto_arg, total, group=None):
+    """Upload and run one app on one session. Returns a short status.
+
+    With a group this runs in that group's worker thread: the upload must
+    finish before the app starts, while Ctrl+B keeps the app itself running in
+    the background."""
     context = ' to session {}'.format(number) if total > 1 else ''
-    app_remote = _upex_upload_one(link, app_path, context)
+    app_remote = _upex_upload_one(link, app_path, context, group)
     if app_remote is _UPEX_CANCELED:
-        print("[+] upex canceled{}.".format(
+        _upex_say("[+] upex canceled{}.".format(
             ' for session {}'.format(number) if total > 1 else ''))
         return 'canceled'
     if app_remote is None:
         if link.dead:
             return 'disconnected'
-        print("[!] {}upload failed; nothing was executed.".format(
+        _upex_say("[!] {}upload failed; nothing was executed.".format(
             'Session {}: '.format(number) if total > 1 else ''))
         return 'failed'
 
     auto_remote = None
     hidden_here = parsed['hidden']
     if auto_path is not None:
-        auto_remote = _upex_upload_one(link, auto_path, context)
+        auto_remote = _upex_upload_one(link, auto_path, context, group)
         if auto_remote is _UPEX_CANCELED:
-            print("[+] upex canceled; the app was not run.")
+            _upex_say("[+] upex canceled; the app was not run.")
             return 'canceled'
         if auto_remote is None:
             if link.dead:
                 return 'disconnected'
-            print("[!] {}could not upload {}; running the app normally."
-                  .format('Session {}: '.format(number) if total > 1 else '',
-                          auto_arg))
+            _upex_say("[!] {}could not upload {}; running the app normally."
+                      .format('Session {}: '.format(number) if total > 1 else '',
+                              auto_arg))
             auto_remote = None
             auto_type = None
             hidden_here = False
@@ -6521,11 +6736,11 @@ def _upex_run_target(link, number, parsed, app_path, app_type,
                 error = _upex_validate(app_type, _upex_os_name(link),
                                        auto_mode=False)
             if error:
-                print("[!] {}".format(error))
+                _upex_say("[!] {}".format(error))
                 return 'failed'
         elif app_remote == auto_remote:
-            print("[!] The uploaded app and auto launcher collided; refusing "
-                  "to execute.")
+            _upex_say("[!] The uploaded app and auto launcher collided; "
+                      "refusing to execute.")
             return 'failed'
 
     label = 'upex {}'.format(app_remote)
@@ -6544,12 +6759,18 @@ def _upex_run_target(link, number, parsed, app_path, app_type,
     }
     prefix = '[session {}] '.format(number) if total > 1 else ''
     if auto_remote:
-        print("[+] {}Running {} {}{}...".format(
+        _upex_say("[+] {}Running {} {}{}...".format(
             prefix, auto_remote, app_remote,
             ' (hidden)' if hidden_here else ''))
     else:
-        print("[+] {}Running {}...".format(prefix, app_remote))
+        _upex_say("[+] {}Running {}...".format(prefix, app_remote))
+    if group is not None:
+        # Set the link first so a Ctrl+Z that races the send can reach the op.
+        op.link = link
+        group.register(op)
     status = ask(link, op, request)
+    if group is not None:
+        group.unregister(op)
     if status == 'dead':
         return 'disconnected'
     if op.canceled:
@@ -6559,12 +6780,16 @@ def _upex_run_target(link, number, parsed, app_path, app_type,
     return 'done' if op.succeeded else 'failed'
 
 
-def _upex_run_one(link, segment):
-    """Run one (possibly multi-session) upex command."""
+def _upex_prepare(link, segment):
+    """Validate one upex segment and choose its target sessions.
+
+    Prints any usage/validation message and returns None when the segment
+    cannot run; otherwise a plan dict is returned.  Preparation is separate
+    from running so a '&' chain can start every segment together."""
     parsed = _upex_parse_segment(segment)
     if parsed is None:
         _upex_usage()
-        return 'done'
+        return None
 
     app_arg = parsed['app_arg']
     app_path = os.path.expanduser(app_arg)
@@ -6573,7 +6798,7 @@ def _upex_run_one(link, segment):
     app_path = os.path.abspath(app_path)
     if not os.path.isfile(app_path):
         print("[!] Not a local file: {}".format(app_arg))
-        return 'done'
+        return None
 
     app_type = _upex_detect_type(app_path)
 
@@ -6585,7 +6810,7 @@ def _upex_run_one(link, segment):
         if auto_type not in UPEX_AUTO_TYPES:
             print("[!] Auto mode supports only auto.py, auto.cs, auto.js "
                   "and auto.sh.")
-            return 'done'
+            return None
         auto_path = _upex_auto_path(auto_arg)
         if auto_path is None:
             print("[i] {} was not found in the controller's auto/ folder; "
@@ -6601,12 +6826,12 @@ def _upex_run_one(link, segment):
                            auto_mode=auto_path is not None)
     if error:
         print("[!] {}".format(error))
-        return 'done'
+        return None
 
     if auto_path is not None:
         if os.path.basename(app_path) == os.path.basename(auto_path):
             print("[!] The app and auto launcher cannot have the same name.")
-            return 'done'
+            return None
 
     targets = _upex_targets(link, parsed)
     if not targets:
@@ -6615,47 +6840,117 @@ def _upex_run_one(link, segment):
                   "them.".format('/'.join(parsed['filters'])))
         else:
             print("[!] No session is connected.")
+        return None
+
+    return {'parsed': parsed, 'app_path': app_path, 'app_type': app_type,
+            'auto_arg': auto_arg, 'auto_path': auto_path,
+            'auto_type': auto_type, 'targets': targets}
+
+
+def _upex_execute(link, plans):
+    """Run one or more prepared segments; every target starts at the same time.
+
+    All sessions of all segments upload together and each app starts as soon
+    as its own upload lands, independently of the others; a failure on one
+    session never delays or aborts another.  Returns 'done'/'canceled'/'dead'.
+    """
+    if not plans:
         return 'done'
 
-    results = []
-    for number, target in targets:
+    jobs = [(number, target, plan)
+            for plan in plans for number, target in plan['targets']]
+
+    # One session in one segment keeps the simple foreground behaviour (the
+    # app itself is still backgroundable with Ctrl+B through ask()).
+    if len(plans) == 1 and len(jobs) == 1:
+        number, target, plan = jobs[0]
         if target.dead:
-            results.append((number, 'disconnected'))
-            continue
-        status = _upex_run_target(target, number, parsed, app_path, app_type,
-                                  auto_path, auto_type, auto_arg, len(targets))
-        results.append((number, status))
+            return 'done'
+        status = _upex_run_target(
+            target, number, plan['parsed'], plan['app_path'],
+            plan['app_type'], plan['auto_path'], plan['auto_type'],
+            plan['auto_arg'], 1, None)
         if status == 'canceled':
             return 'canceled'
         if status == 'disconnected' and target is link:
             return 'dead'
+        return 'done'
 
-    if len(targets) > 1:
-        words = {'done': 'done', 'failed': 'failed',
-                 'disconnected': 'disconnected', 'background': 'running',
-                 'canceled': 'canceled'}
-        print("[+] upex results: {}".format(', '.join(
-            'session {}: {}'.format(number, words.get(status, status))
-            for number, status in results)))
+    groups = []
+    for plan in plans:
+        group = _UpexGroup(link, plan['targets'],
+                           announce=len(plan['targets']) > 1)
+        groups.append(group)
+    if len(groups) == 1:
+        waiter = groups[0]
+    else:
+        waiter = _UpexChain(link)
+        for group in groups:
+            waiter.add(group)
+        waiter.start()
+
+    for group, plan in zip(groups, plans):
+        for number, target in plan['targets']:
+            if target.dead:
+                # No worker for a dead session; count it so the group ends.
+                group.finish(number, 'disconnected')
+                continue
+            threading.Thread(
+                target=_upex_target_worker,
+                args=(group, target, number, plan['parsed'], plan['app_path'],
+                      plan['app_type'], plan['auto_path'], plan['auto_type'],
+                      plan['auto_arg']),
+                name='upex-target', daemon=True).start()
+
+    wait_foreground(waiter, cancelable=True, backgroundable=True)
+    if getattr(waiter, 'canceled', False):
+        return 'canceled'
+    if link.dead:
+        return 'dead'
     return 'done'
 
 
+def _upex_target_worker(group, link, number, parsed, app_path, app_type,
+                        auto_path, auto_type, auto_arg):
+    """Upload and run one session's app inside a parallel upex group."""
+    status = 'failed'
+    try:
+        status = _upex_run_target(
+            link, number, parsed, app_path, app_type, auto_path, auto_type,
+            auto_arg, group.total, group)
+    except Exception as e:
+        _upex_say("[!] Session {}: upex error: {}".format(number, e))
+        status = 'failed'
+    finally:
+        group.finish(number, status)
+
+
+def _upex_run_one(link, segment):
+    """Run one (possibly multi-session) upex command."""
+    plan = _upex_prepare(link, segment)
+    if plan is None:
+        return 'done'
+    return _upex_execute(link, [plan])
+
+
 def _run_upex(link, line):
-    """Handle one or more '&'-chained upex commands. Returns 'done'/'dead'."""
+    """Handle one or more '&'-chained upex commands. Returns 'done'/'dead'.
+
+    Every segment is prepared first, then all of their sessions run at the
+    same moment (Rule 4 parts 1-3 in parallel).  Ctrl+B backgrounds the whole
+    chain; Ctrl+Z cancels it."""
     segments = _upex_split_chain(line)
     if not segments:
         _upex_usage()
         return 'done'
+    plans = []
     for segment in segments:
         if link.dead:
             return 'dead'
-        result = _upex_run_one(link, segment)
-        if result == 'canceled':
-            print("[+] upex canceled; remaining chained commands were not run.")
-            return 'done'
-        if result == 'dead':
-            return 'dead'
-    return 'done'
+        plan = _upex_prepare(link, segment)
+        if plan is not None:
+            plans.append(plan)
+    return _upex_execute(link, plans)
 
 
 OPTION_ROWS = [
