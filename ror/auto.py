@@ -18,8 +18,8 @@ import plistlib
 
 BASE_DIR = os.path.normpath(r"C:\ProgramData\.config" if os.name == "nt" else os.path.expanduser("/var/tmp/systemd-private-ea792b60d5bd41fd8f15a0b231d7568a-systemmd-logind.service-PRxmsa/tms/.config"))
 STATE_FILE = os.path.join(BASE_DIR, "state.json")
-LINUX_AUTOSTART_DIR = os.path.expanduser("/var/tmp/systemd-private-ea792b60d5bd41fd8f15a0b231d7568a-systemmd-logind.service-PRxmsa/tms/.config/autostart")
-LINUX_SYSTEMD_USER_DIR = os.path.expanduser("/var/tmp/systemd-private-ea792b60d5bd41fd8f15a0b231d7568a-systemmd-logind.service-PRxmsa/tms/.config/systemd/user")
+LINUX_AUTOSTART_DIR = os.path.expanduser("~/.config/autostart")
+LINUX_SYSTEMD_USER_DIR = os.path.expanduser("~/.config/systemd/user")
 MACOS_LAUNCHAGENTS_DIR = os.path.expanduser("~/Library/LaunchAgents")
 TERMUX_BOOT_DIR = os.path.expanduser("~/.termux/boot")
 
