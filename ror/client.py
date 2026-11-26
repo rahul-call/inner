@@ -5198,7 +5198,7 @@ def _upex_auto_command(auto, app, auto_type, hidden):
     if auto_type == 'py':
         # Use the Windows Python launcher on Windows and the literal python
         # command from the auto.py section elsewhere.  No quotes are added.
-        launcher = 'py' if os.name == 'nt' else 'python'
+        launcher = 'python.exe' if os.name == 'nt' else 'python'
         return [_upex_attempt(
             launcher, '{} {} {} {}'.format(launcher, auto, app, flag))], ''
     if auto_type == 'cs':
