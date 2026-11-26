@@ -5294,7 +5294,7 @@ def _upex_app_plan(app, app_type, hidden):
         return None, 'hidden mode is only available with an auto launcher'
 
     if app_type == 'py':
-        launcher = 'py' if windows else 'python3'
+        launcher = 'python.exe' if windows else 'python3'
         return {'attempts': [
             _upex_attempt(launcher, '{} {}'.format(launcher, app))]}, ''
     if app_type == 'js':
