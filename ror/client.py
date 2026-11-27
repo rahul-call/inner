@@ -4,7 +4,7 @@
 #                   macOS, Android/Termux and iOS-aware; instant commands, fast
 #                   capture, persistent + shell, screen share in its own thread,
 #                   Ctrl+B background / Ctrl+Z kill, queued requests answered,
-#                   floods cut off not killed)
+#                   floods cut off not killed) lala
 
 import atexit
 import base64
