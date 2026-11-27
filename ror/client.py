@@ -578,6 +578,7 @@ def _new_job(req_id):
         'why': 'Ctrl+Z',        # shown in the 'stopped' note
         'proc': None,           # the running Popen, so a cancel can kill it now
         'killed': False,        # set by the receive loop when it cancels us
+        'persist': False,       # upex only: survive exit/link loss/session exit
         'lock': threading.Lock(),
     }
 
@@ -615,12 +616,42 @@ def _cancel_job(job, why='Ctrl+Z'):
             pass
 
 
-def _cancel_all_jobs(why):
-    """Cancel every running command (Ctrl+Z for all, exit, or a lost link)."""
+def _cancel_all_jobs(why, include_persistent=True):
+    """Cancel running commands.
+
+    ``include_persistent=False`` is used by controller exit / lost link /
+    session exit: an upex app (job['persist']) must keep running in those
+    cases and stops only through an explicit Ctrl+Z / 'stop' (the id-based
+    cancel), which carries this job's request id and calls ``_cancel_job``
+    directly.
+    The legacy id-less ``cmd_kill`` keeps the default so 'stop' still works.
+    """
     with ACTIVE_JOBS_LOCK:
         jobs = list(ACTIVE_JOBS.values())
     for job in jobs:
+        if not include_persistent and job.get('persist'):
+            continue
         _cancel_job(job, why)
+
+
+def _persistent_jobs():
+    """upex jobs that must outlive the controller link (cleanup helper)."""
+    with ACTIVE_JOBS_LOCK:
+        return [job for job in ACTIVE_JOBS.values() if job.get('persist')]
+
+
+def _wait_persistent_jobs():
+    """Keep this process alive until every persistent upex app has finished.
+
+    A session exit must not kill the app.  The client owns the read end of the
+    app's stdout pipe, so exiting early could give the app SIGPIPE (or a broken
+    pipe on Windows) the moment it writes.  Staying here drains that pipe until
+    the app ends; no controller link is needed and no reconnection happens.
+    Ctrl+Z / 'stop' can still cancel the app while the link is alive, and then
+    this returns immediately.
+    """
+    while _persistent_jobs():
+        time.sleep(0.25)
 
 
 def _send_chunked(conn, payload, stall_timeout=None, deadline=None):
@@ -5478,7 +5509,9 @@ def _send_job_reply(conn, req_id, text, exit_code):
         reply['exit_code'] = exit_code
     try:
         send_msg(conn, reply)
-    except OSError:
+    except Exception:
+        # The job may intentionally outlive its link (persistent upex): the
+        # answer has nowhere to go, which must never kill the worker thread.
         pass
 
 
@@ -5510,12 +5543,16 @@ def _screenshot_job(conn, req_id, job):
             pass
 
 
-def _start_job(conn, req_id, target, args, name):
+def _start_job(conn, req_id, target, args, name, persist=False):
     """Run target(*args, job) in a worker thread.
 
     Returns False (and answers with an error) when too many operations are
-    already running, so a small device cannot be exhausted by a flood."""
+    already running, so a small device cannot be exhausted by a flood.
+    ``persist=True`` (upex only) keeps the job alive when the controller
+    exits, the link is lost, or the session is ended; only an explicit
+    Ctrl+Z / 'stop' (the id-based cancel) for this request stops it."""
     job = _new_job(req_id)
+    job['persist'] = bool(persist)
     if not _register_job(job):
         try:
             send_msg(conn, {'type': 'error', 'id': req_id,
@@ -8420,7 +8457,10 @@ def main():
 
                 if mtype == 'exit':
                     stop_stream(wait=0.5)
-                    _cancel_all_jobs('exit')     # long commands die with us
+                    # A running upex app is persistent: it keeps running even
+                    # though this client session is ending.  Other commands
+                    # still die with the session, as before.
+                    _cancel_all_jobs('exit', include_persistent=False)
                     try:
                         send_msg(client_socket, {'type': 'output', 'id': req_id,
                                                  'data': '[client] shutting down'})
@@ -8454,9 +8494,12 @@ def main():
                     continue
 
                 if mtype == 'upex':
+                    # persist=True: this app keeps running when the controller
+                    # exits, the link drops, or the session is ended.  Only an
+                    # explicit Ctrl+Z / 'stop' / 'cancel' stops it.
                     _start_job(client_socket, req_id, _upex_job,
                                (client_socket, msg, current_dir, req_id),
-                               'upex')
+                               'upex', persist=True)
                     continue
 
                 if mtype in ('cmd_kill', 'cancel'):
@@ -8624,7 +8667,10 @@ def main():
         except Exception as e:                  # never let one bad message kill us
             print("[!] Unexpected error: {}. Reconnecting...".format(e))
 
-        _cancel_all_jobs('controller disconnected')  # long commands die with the link
+        # Long commands die with the link, but an upex app does not: it was
+        # asked to keep running until Ctrl+Z / 'stop' / 'cancel'.  A later
+        # reconnect gets a fresh link; the app (and its output pipe) continue.
+        _cancel_all_jobs('controller disconnected', include_persistent=False)
         stop_stream(wait=0.5)                   # a share cannot outlive its socket
         stop_shell()                            # ... and neither can an old shell
         _abort_outgoing_transfers()             # stop download workers
@@ -8639,6 +8685,10 @@ def main():
             pass
 
         if stop:
+            # 'exit session' ends this session, not the upex apps it started.
+            # Stay as a silent keeper until they finish so their stdout pipe
+            # never breaks under them; then exit for good (no reconnect).
+            _wait_persistent_jobs()
             print("[+] Controller requested shutdown. Exiting.")
             break
         # otherwise: wait one retry interval, so a peer that accepts and then
