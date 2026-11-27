@@ -10,6 +10,7 @@ import atexit
 import base64
 import codecs
 import contextlib
+from collections import deque
 import errno
 import hashlib
 import importlib.util
@@ -556,7 +557,8 @@ def recv_exact(conn, n, stall=False, deadline=None):
 SEND_LOCK = threading.Lock()    # one writer at a time: frames and replies
 CANCELED = {}                   # request ids the controller stopped -> why (Ctrl+Z/stop)
 CANCELED_LOCK = threading.Lock()
-DEFERRED = []                   # requests that arrived while a command was running
+DEFERRED = deque()              # requests that arrived while a command was running
+DEFERRED_BYTES = 0              # running total of the weights in DEFERRED (O(1) bound check)
 MAX_DEFERRED = 32               # bound queued requests so a slow command cannot OOM
 MAX_DEFERRED_BYTES = 128 * 1024 * 1024
 
@@ -782,15 +784,35 @@ def _defer_message(msg):
     A controller that queues large uploads while a long command runs could
     otherwise grow this list without limit (each message can approach
     MAX_MSG). Rejecting excess requests with an error is better than an OOM
-    on a phone or a small server."""
+    on a phone or a small server.
+
+    DEFERRED_BYTES is maintained incrementally: the old code re-walked every
+    queued message on each insert (O(n^2) over a burst of queued uploads).
+    """
+    global DEFERRED_BYTES
     if len(DEFERRED) >= MAX_DEFERRED:
         return False
     weight = _message_weight(msg)
-    queued = sum(_message_weight(item) for item in DEFERRED)
-    if queued + weight > MAX_DEFERRED_BYTES:
+    if DEFERRED_BYTES + weight > MAX_DEFERRED_BYTES:
         return False
-    DEFERRED.append(msg)
+    DEFERRED.append((weight, msg))
+    DEFERRED_BYTES += weight
     return True
+
+
+def _clear_deferred():
+    """Drop everything queued for a link that is gone (O(1), not O(n) pops)."""
+    global DEFERRED_BYTES
+    DEFERRED.clear()
+    DEFERRED_BYTES = 0
+
+
+def _pop_deferred():
+    """Pop the oldest queued message and keep the running byte total exact."""
+    global DEFERRED_BYTES
+    weight, msg = DEFERRED.popleft()
+    DEFERRED_BYTES -= weight
+    return msg
 
 
 def recv_msg(conn, deadline=None):
@@ -820,6 +842,14 @@ _WINDOWS_RESERVED_NAMES = (
     | {'COM{}'.format(i) for i in range(1, 10)}
     | {'LPT{}'.format(i) for i in range(1, 10)})
 
+# A single C-level translate() replaces the former per-character Python loop
+# in _safe_transfer_rel; every transfer entry calls that function.
+_TRANSFER_PATH_BAD = {ord(c): '_' for c in '<>:"|?*'}
+for _code in range(32):
+    _TRANSFER_PATH_BAD[_code] = '_'
+_TRANSFER_PATH_BAD[0x7f] = '_'
+del _code
+
 
 def _safe_transfer_rel(value):
     """Normalize a remote path so it can never escape the destination.
@@ -840,13 +870,7 @@ def _safe_transfer_rel(value):
             continue
         if part == '..':
             return None
-        cleaned = []
-        for char in part:
-            if char in '<>:"|?*' or ord(char) < 32 or char == '\x7f':
-                cleaned.append('_')
-            else:
-                cleaned.append(char)
-        part = ''.join(cleaned).rstrip(' .')
+        part = part.translate(_TRANSFER_PATH_BAD).rstrip(' .')
         if not part:
             continue
         if part.split('.', 1)[0].upper() in _WINDOWS_RESERVED_NAMES:
@@ -913,20 +937,52 @@ def _scan_transfer_tree(path, top_name=None, cancel=None):
     seen = set()
     total_files = 0
     total_bytes = 0
-    for base, dirnames, filenames in os.walk(source, followlinks=False):
-        if stopped():
-            return None
-        rel_base = os.path.relpath(base, source)
-        rel_parent = None if rel_base == '.' else _safe_transfer_rel(rel_base)
-        if rel_base != '.' and not rel_parent:
-            # The parent was already skipped; do not send its descendants.
-            warnings.append('skipped unsafe folder {}'.format(rel_base))
-            dirnames[:] = []
-            continue
+
+    def walk(base, rel_parent):
+        """Depth-first and sorted exactly like os.walk(), but each directory
+        entry is stat'ed at most once.
+
+        The old loop used os.walk() (which already calls scandir) and then
+        called os.path.islink() plus os.lstat() again for every file: three
+        filesystem lookups per entry.  DirEntry carries the same information
+        from one scandir, so a huge folder is now O(n) with a much smaller
+        constant and no repeated syscalls.
+        """
+        nonlocal total_files, total_bytes
+        try:
+            with os.scandir(base) as scan:
+                dirs = []
+                files_here = []
+                for entry in scan:
+                    try:
+                        is_dir = entry.is_dir()      # follows links, like os.walk
+                    except OSError:
+                        is_dir = False
+                    if is_dir:
+                        try:
+                            is_link = entry.is_symlink()
+                        except OSError:
+                            is_link = False
+                        dirs.append((entry.name, entry.path, is_link))
+                        continue
+                    try:
+                        is_link = entry.is_symlink()
+                    except OSError:
+                        is_link = False
+                    info = error = None
+                    if not is_link:
+                        try:
+                            info = entry.stat(follow_symlinks=False)
+                        except OSError as exc:
+                            error = exc
+                    files_here.append((entry.name, entry.path, is_link, info, error))
+        except OSError:
+            return True                  # os.walk(onerror=None) silently skips it
         kept = []
-        for name in sorted(dirnames):
-            full = os.path.join(base, name)
-            if os.path.islink(full):
+        for name, full, is_link in sorted(dirs, key=lambda item: item[0]):
+            if stopped():
+                return False
+            if is_link:
                 warnings.append('skipped symlink {}'.format(full))
                 continue
             rel = _safe_transfer_rel(
@@ -939,19 +995,16 @@ def _scan_transfer_tree(path, top_name=None, cancel=None):
                 continue
             seen.add(rel)
             entries.append({'path': rel, 'kind': 'dir'})
-            kept.append(name)
-        dirnames[:] = kept
-        for name in sorted(filenames):
+            kept.append((full, rel))
+        for name, full, is_link, info, error in sorted(
+                files_here, key=lambda item: item[0]):
             if stopped():
-                return None
-            full = os.path.join(base, name)
-            if os.path.islink(full):
+                return False
+            if is_link:
                 warnings.append('skipped symlink {}'.format(full))
                 continue
-            try:
-                info = os.lstat(full)
-            except OSError as e:
-                warnings.append('skipped {}: {}'.format(full, e))
+            if error is not None:
+                warnings.append('skipped {}: {}'.format(full, error))
                 continue
             if not stat.S_ISREG(info.st_mode):
                 warnings.append('skipped special file {}'.format(full))
@@ -971,6 +1024,13 @@ def _scan_transfer_tree(path, top_name=None, cancel=None):
             files.append((rel, full, int(info.st_size), mode))
             total_files += 1
             total_bytes += int(info.st_size)
+        for full, rel in kept:
+            if not walk(full, rel):
+                return False
+        return True
+
+    if not walk(source, None):
+        return None
     if stopped():
         return None
     return {'source': source, 'kind': 'dir', 'root': root, 'entries': entries,
@@ -6515,19 +6575,61 @@ def _resolve_host(host, port, timeout=5.0):
     raise socket.timeout('name resolution timed out for {}'.format(host))
 
 
+_GOOD_ADDR = {}                    # (host, port) -> (family, socktype, proto,
+_GOOD_ADDR_LOCK = threading.Lock()  #  sockaddr, time) that last connected
+ADDR_CACHE_TTL = 600               # RFC 8305: remember the winner for ~10 min
+
+
+def _order_addresses(host, port, addresses):
+    """IPv6/IPv4 interleaving with the last good address tried first.
+
+    Two RFC 8305 points matter on a dual-stack machine whose IPv6 path is
+    blackholed.  First, a hostname that resolves to several IPv6 addresses used
+    to spend a full CONNECT_TIMEOUT on each one before IPv4 was ever tried;
+    interleaving the families makes IPv4 one attempt away.  Second, the address
+    that actually connected is remembered, so the frequent reconnect loop
+    starts with the endpoint that already proved reachable instead of repeating
+    the same failed attempt."""
+    deduped = []
+    seen = set()
+    for family, socktype, proto, _canon, sockaddr in addresses:
+        marker = (family, sockaddr)
+        if marker not in seen:
+            seen.add(marker)
+            deduped.append((family, socktype, proto, sockaddr))
+    v6 = [item for item in deduped if item[0] == socket.AF_INET6]
+    v4 = [item for item in deduped if item[0] == socket.AF_INET]
+    other = [item for item in deduped
+             if item[0] not in (socket.AF_INET6, socket.AF_INET)]
+    ordered = []
+    for index in range(max(len(v6), len(v4))):
+        if index < len(v6):
+            ordered.append(v6[index])
+        if index < len(v4):
+            ordered.append(v4[index])
+    ordered.extend(other)
+    with _GOOD_ADDR_LOCK:
+        cached = _GOOD_ADDR.get((host, port))
+    if cached and time.time() - cached[4] <= ADDR_CACHE_TTL:
+        winner = cached[:4]
+        if winner in ordered:
+            ordered.remove(winner)
+            ordered.insert(0, winner)
+    return ordered
+
+
 def _connect_target(host, port):
     """Connect by IP without DNS, or by hostname with our bounded resolver."""
     if _is_numeric_host(host):
         return socket.create_connection((host, port), timeout=CONNECT_TIMEOUT)
     addresses = _resolve_host(host, port)
     last_error = None
-    for family, socktype, proto, _canon, sockaddr in addresses:
+    for family, socktype, proto, sockaddr in _order_addresses(host, port, addresses):
         candidate = None
         try:
             candidate = socket.socket(family, socktype, proto)
             candidate.settimeout(CONNECT_TIMEOUT)
             candidate.connect(sockaddr)
-            return candidate
         except OSError as e:
             last_error = e
             if candidate is not None:
@@ -6535,6 +6637,11 @@ def _connect_target(host, port):
                     candidate.close()
                 except OSError:
                     pass
+            continue
+        with _GOOD_ADDR_LOCK:
+            _GOOD_ADDR[(host, port)] = (family, socktype, proto, sockaddr,
+                                        time.time())
+        return candidate
     raise last_error or OSError('no usable address for {}'.format(host))
 
 
@@ -8280,16 +8387,20 @@ def _raw_handshake(sock, role, token=None):
         line = CMON_MAGIC
     sock.settimeout(HTTP_HANDSHAKE_TIMEOUT)
     sock.sendall(line)
-    data = b''
+    # Read in one bounded chunk instead of one syscall per byte.  The
+    # acknowledgement is a single short line; the old recv(1) loop paid a
+    # syscall per character during every TCP/TLS connect.
+    data = bytearray()
     while b'\n' not in data:
-        chunk = sock.recv(1)
+        chunk = sock.recv(512)
         if not chunk:
             raise TransportNotSupported('controller closed during CMON2 handshake')
         data += chunk
         if len(data) > 512:
             raise TransportNotSupported('CMON2 acknowledgement is too long')
     if not data.startswith(CMON_ACK.strip()):
-        raise TransportNotSupported('unexpected CMON2 acknowledgement: {!r}'.format(data))
+        raise TransportNotSupported('unexpected CMON2 acknowledgement: {!r}'.format(
+            bytes(data)))
     sock.settimeout(None)
     return sock
 
@@ -8417,14 +8528,14 @@ def main():
         # a proxy that buffers request bodies can never be mistaken for a live
         # full-duplex link.  Serve commands until the controller goes away.
         stop = False
-        del DEFERRED[:]                      # nothing left over from a dead session
+        _clear_deferred()                    # nothing left over from a dead session
         with CANCELED_LOCK:
             CANCELED.clear()
         try:
             while True:
                 if DEFERRED:
                     # Requests read while a command was running - in order.
-                    msg = DEFERRED.pop(0)
+                    msg = _pop_deferred()
                 else:
                     msg = recv_msg(client_socket)
                 if msg is None:              # controller closed the connection
